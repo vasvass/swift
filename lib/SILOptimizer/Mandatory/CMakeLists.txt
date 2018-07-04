@@ -1,0 +1,21 @@
+silopt_register_sources(
+  AccessEnforcementSelection.cpp
+  AccessMarkerElimination.cpp
+  AddressLowering.cpp
+  ConstantPropagation.cpp
+  DefiniteInitialization.cpp
+  DIMemoryUseCollectorOwnership.cpp
+  DataflowDiagnostics.cpp
+  DiagnoseInfiniteRecursion.cpp
+  DiagnoseStaticExclusivity.cpp
+  DiagnoseUnreachable.cpp
+  GuaranteedARCOpts.cpp
+  IRGenPrepare.cpp
+  MandatoryInlining.cpp
+  PredictableMemOpt.cpp
+  PMOMemoryUseCollector.cpp
+  SemanticARCOpts.cpp
+  ClosureLifetimeFixup.cpp
+  RawSILInstLowering.cpp
+  MandatoryOptUtils.cpp
+)

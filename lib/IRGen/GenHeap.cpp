@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,16 +16,21 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Intrinsics.h"
 
-#include "swift/Basic/Fallthrough.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/ABI/MetadataValues.h"
+#include "swift/AST/ASTContext.h"
+#include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/IRGenOptions.h"
 
+#include "ConstantBuilder.h"
 #include "Explosion.h"
+#include "GenClass.h"
 #include "GenProto.h"
 #include "GenType.h"
 #include "IRGenDebugInfo.h"
@@ -33,7 +38,7 @@
 #include "IRGenModule.h"
 #include "HeapTypeInfo.h"
 #include "IndirectTypeInfo.h"
-#include "UnownedTypeInfo.h"
+#include "MetadataRequest.h"
 #include "WeakTypeInfo.h"
 
 #include "GenHeap.h"
@@ -76,6 +81,34 @@ HeapLayout::HeapLayout(IRGenModule &IGM, LayoutStrategy strategy,
 #endif
 }
 
+static llvm::Value *calcInitOffset(swift::irgen::IRGenFunction &IGF,
+                                   unsigned int i,
+                                   const swift::irgen::HeapLayout &layout) {
+  llvm::Value *offset = nullptr;
+  if (i == 0) {
+    auto startoffset = layout.getSize();
+    offset = llvm::ConstantInt::get(IGF.IGM.SizeTy, startoffset.getValue());
+    return offset;
+  }
+  auto &prevElt = layout.getElement(i - 1);
+  auto prevType = layout.getElementTypes()[i - 1];
+  // Start calculating offsets from the last fixed-offset field.
+  Size lastFixedOffset = layout.getElement(i - 1).getByteOffset();
+  if (auto *fixedType = dyn_cast<FixedTypeInfo>(&prevElt.getTypeForLayout())) {
+    // If the last fixed-offset field is also fixed-size, we can
+    // statically compute the end of the fixed-offset fields.
+    auto fixedEnd = lastFixedOffset + fixedType->getFixedSize();
+    offset = llvm::ConstantInt::get(IGF.IGM.SizeTy, fixedEnd.getValue());
+  } else {
+    // Otherwise, we need to add the dynamic size to the fixed start
+    // offset.
+    offset = llvm::ConstantInt::get(IGF.IGM.SizeTy, lastFixedOffset.getValue());
+    offset = IGF.Builder.CreateAdd(
+        offset, prevElt.getTypeForLayout().getSize(IGF, prevType));
+  }
+  return offset;
+}
+
 HeapNonFixedOffsets::HeapNonFixedOffsets(IRGenFunction &IGF,
                                          const HeapLayout &layout) {
   if (!layout.isFixedLayout()) {
@@ -91,8 +124,8 @@ HeapNonFixedOffsets::HeapNonFixedOffsets(IRGenFunction &IGF,
       case ElementLayout::Kind::InitialNonFixedSize:
         // Factor the non-fixed-size field's alignment into the total alignment.
         totalAlign = IGF.Builder.CreateOr(totalAlign,
-                                    elt.getType().getAlignmentMask(IGF, eltTy));
-        SWIFT_FALLTHROUGH;
+                                    elt.getTypeForLayout().getAlignmentMask(IGF, eltTy));
+        LLVM_FALLTHROUGH;
       case ElementLayout::Kind::Empty:
       case ElementLayout::Kind::Fixed:
         // Don't need to dynamically calculate this offset.
@@ -102,31 +135,12 @@ HeapNonFixedOffsets::HeapNonFixedOffsets(IRGenFunction &IGF,
       case ElementLayout::Kind::NonFixed:
         // Start calculating non-fixed offsets from the end of the first fixed
         // field.
-        assert(i > 0 && "shouldn't begin with a non-fixed field");
-        auto &prevElt = layout.getElement(i-1);
-        auto prevType = layout.getElementTypes()[i-1];
-        // Start calculating offsets from the last fixed-offset field.
         if (!offset) {
-          Size lastFixedOffset = layout.getElement(i-1).getByteOffset();
-          if (auto *fixedType = dyn_cast<FixedTypeInfo>(&prevElt.getType())) {
-            // If the last fixed-offset field is also fixed-size, we can
-            // statically compute the end of the fixed-offset fields.
-            auto fixedEnd = lastFixedOffset + fixedType->getFixedSize();
-            offset
-              = llvm::ConstantInt::get(IGF.IGM.SizeTy, fixedEnd.getValue());
-          } else {
-            // Otherwise, we need to add the dynamic size to the fixed start
-            // offset.
-            offset
-              = llvm::ConstantInt::get(IGF.IGM.SizeTy,
-                                       lastFixedOffset.getValue());
-            offset = IGF.Builder.CreateAdd(offset,
-                                     prevElt.getType().getSize(IGF, prevType));
-          }
+          offset = calcInitOffset(IGF, i, layout);
         }
         
         // Round up to alignment to get the offset.
-        auto alignMask = elt.getType().getAlignmentMask(IGF, eltTy);
+        auto alignMask = elt.getTypeForLayout().getAlignmentMask(IGF, eltTy);
         auto notAlignMask = IGF.Builder.CreateNot(alignMask);
         offset = IGF.Builder.CreateAdd(offset, alignMask);
         offset = IGF.Builder.CreateAnd(offset, notAlignMask);
@@ -135,7 +149,7 @@ HeapNonFixedOffsets::HeapNonFixedOffsets(IRGenFunction &IGF,
         
         // Advance by the field's size to start the next field.
         offset = IGF.Builder.CreateAdd(offset,
-                                       elt.getType().getSize(IGF, eltTy));
+                                       elt.getTypeForLayout().getSize(IGF, eltTy));
         totalAlign = IGF.Builder.CreateOr(totalAlign, alignMask);
 
         break;
@@ -156,6 +170,14 @@ void irgen::emitDeallocateHeapObject(IRGenFunction &IGF,
   // FIXME: We should call a fast deallocator for heap objects with
   // known size.
   IGF.Builder.CreateCall(IGF.IGM.getDeallocObjectFn(),
+                         {object, size, alignMask});
+}
+
+void emitDeallocateUninitializedHeapObject(IRGenFunction &IGF,
+                                           llvm::Value *object,
+                                           llvm::Value *size,
+                                           llvm::Value *alignMask) {
+  IGF.Builder.CreateCall(IGF.IGM.getDeallocUninitializedObjectFn(),
                          {object, size, alignMask});
 }
 
@@ -188,7 +210,10 @@ static llvm::Function *createDtorFn(IRGenModule &IGM,
     llvm::Function::Create(IGM.DeallocatingDtorTy,
                            llvm::Function::PrivateLinkage,
                            "objectdestroy", &IGM.Module);
-  fn->setAttributes(IGM.constructInitialAttributes());
+  auto attrs = IGM.constructInitialAttributes();
+  IGM.addSwiftSelfAttributes(attrs, 0);
+  fn->setAttributes(attrs);
+  fn->setCallingConv(IGM.SwiftCC);
 
   IRGenFunction IGF(IGM, fn);
   if (IGM.DebugInfo)
@@ -201,7 +226,7 @@ static llvm::Function *createDtorFn(IRGenModule &IGM,
     // The type metadata bindings should be at a fixed offset, so we can pass
     // None for NonFixedOffsets. If we didn't, we'd have a chicken-egg problem.
     auto bindingsAddr = layout.getElement(0).project(IGF, structAddr, None);
-    layout.getBindings().restore(IGF, bindingsAddr);
+    layout.getBindings().restore(IGF, bindingsAddr, MetadataState::Complete);
   }
 
   // Figure out the non-fixed offsets.
@@ -214,8 +239,9 @@ static llvm::Function *createDtorFn(IRGenModule &IGM,
     if (field.isPOD())
       continue;
 
-    field.getType().destroy(IGF, field.project(IGF, structAddr, offsets),
-                            fieldTy);
+    field.getTypeForAccess().destroy(
+        IGF, field.project(IGF, structAddr, offsets), fieldTy,
+        true /*Called from metadata constructors: must be outlined*/);
   }
 
   emitDeallocateHeapObject(IGF, &*fn->arg_begin(), offsets.getSize(),
@@ -250,13 +276,20 @@ llvm::Constant *HeapLayout::createSizeFn(IRGenModule &IGM) const {
 static llvm::Constant *buildPrivateMetadata(IRGenModule &IGM,
                                             const HeapLayout &layout,
                                             llvm::Constant *dtorFn,
+                                            llvm::Constant *captureDescriptor,
                                             MetadataKind kind) {
   // Build the fields of the private metadata.
-  SmallVector<llvm::Constant*, 4> fields;
-  fields.push_back(dtorFn);
-  fields.push_back(llvm::ConstantPointerNull::get(IGM.WitnessTablePtrTy));
-  fields.push_back(llvm::ConstantStruct::get(IGM.TypeMetadataStructTy,
-                                             getMetadataKind(IGM, kind)));
+  ConstantInitBuilder builder(IGM);
+  auto fields = builder.beginStruct(IGM.FullBoxMetadataStructTy);
+
+  fields.add(dtorFn);
+  fields.addNullPointer(IGM.WitnessTablePtrTy);
+  {
+    auto kindStruct = fields.beginStruct(IGM.TypeMetadataStructTy);
+    kindStruct.add(getMetadataKind(IGM, kind));
+    kindStruct.finishAndAddTo(fields);
+  }
+
   // Figure out the offset to the first element, which is necessary to be able
   // to polymorphically project as a generic box.
   auto elements = layout.getElements();
@@ -266,16 +299,15 @@ static llvm::Constant *buildPrivateMetadata(IRGenModule &IGM,
     offset = elements[0].getByteOffset();
   else
     offset = Size(0);
-  fields.push_back(llvm::ConstantInt::get(IGM.Int32Ty, offset.getValue()));
+  fields.addInt32(offset.getValue());
 
-  llvm::Constant *init =
-    llvm::ConstantStruct::get(IGM.FullBoxMetadataStructTy, fields);
+  fields.add(captureDescriptor);
 
   llvm::GlobalVariable *var =
-    new llvm::GlobalVariable(IGM.Module, IGM.FullBoxMetadataStructTy,
-                             /*constant*/ true,
-                             llvm::GlobalVariable::PrivateLinkage, init,
-                             "metadata");
+    fields.finishAndCreateGlobal("metadata",
+                                 IGM.getPointerAlignment(),
+                                 /*constant*/ true,
+                                 llvm::GlobalVariable::PrivateLinkage);
 
   llvm::Constant *indices[] = {
     llvm::ConstantInt::get(IGM.Int32Ty, 0),
@@ -285,17 +317,21 @@ static llvm::Constant *buildPrivateMetadata(IRGenModule &IGM,
       /*Ty=*/nullptr, var, indices);
 }
 
-llvm::Constant *HeapLayout::getPrivateMetadata(IRGenModule &IGM) const {
+llvm::Constant *
+HeapLayout::getPrivateMetadata(IRGenModule &IGM,
+                               llvm::Constant *captureDescriptor) const {
   if (!privateMetadata)
     privateMetadata = buildPrivateMetadata(IGM, *this, createDtorFn(IGM, *this),
+                                           captureDescriptor,
                                            MetadataKind::HeapLocalVariable);
   return privateMetadata;
 }
 
 llvm::Value *IRGenFunction::emitUnmanagedAlloc(const HeapLayout &layout,
                                                const llvm::Twine &name,
+                                           llvm::Constant *captureDescriptor,
                                            const HeapNonFixedOffsets *offsets) {
-  llvm::Value *metadata = layout.getPrivateMetadata(IGM);
+  llvm::Value *metadata = layout.getPrivateMetadata(IGM, captureDescriptor);
   llvm::Value *size, *alignMask;
   if (offsets) {
     size = offsets->getSize();
@@ -322,7 +358,7 @@ namespace {
       return ReferenceCounting::Native;
     }
   };
-}
+} // end anonymous namespace
 
 const LoadableTypeInfo *TypeConverter::convertBuiltinNativeObject() {
   return new BuiltinNativeObjectTypeInfo(IGM.RefCountedPtrTy,
@@ -370,7 +406,7 @@ namespace {
       return storeHeapObjectExtraInhabitant(IGF, index, dest);
     }
   };
-}
+} // end anonymous namespace
 
 const LoadableTypeInfo *
 TypeConverter::createUnmanagedStorageType(llvm::Type *valueType) {
@@ -383,92 +419,110 @@ TypeConverter::createUnmanagedStorageType(llvm::Type *valueType) {
 namespace {
   /// A type implementation for an [unowned] reference to an object
   /// with a known-Swift reference count.
-  class SwiftUnownedReferenceTypeInfo
-    : public SingleScalarTypeInfo<SwiftUnownedReferenceTypeInfo,
-                                  UnownedTypeInfo> {
+  class NativeUnownedReferenceTypeInfo
+    : public SingleScalarTypeInfo<NativeUnownedReferenceTypeInfo,
+                                  LoadableTypeInfo> {
+    llvm::Type *ValueType;
   public:
-    SwiftUnownedReferenceTypeInfo(llvm::Type *type,
-                                  const SpareBitVector &spareBits,
-                                  Size size, Alignment alignment)
-      : SingleScalarTypeInfo(type, size, spareBits, alignment) {}
+    NativeUnownedReferenceTypeInfo(llvm::Type *valueType,
+                                   llvm::Type *unownedType,
+                                   SpareBitVector &&spareBits,
+                                   Size size, Alignment alignment)
+      : SingleScalarTypeInfo(unownedType, size, std::move(spareBits),
+                             alignment, IsNotPOD, IsFixedSize),
+        ValueType(valueType) {}
 
     enum { IsScalarPOD = false };
 
-    void emitScalarRetain(IRGenFunction &IGF, llvm::Value *value) const {
-      IGF.emitNativeUnownedRetain(value);
+    llvm::Type *getScalarType() const {
+      return ValueType;
     }
 
-    void emitScalarRelease(IRGenFunction &IGF, llvm::Value *value) const {
-      IGF.emitNativeUnownedRelease(value);
+    Address projectScalar(IRGenFunction &IGF, Address addr) const {
+      return IGF.Builder.CreateBitCast(addr, ValueType->getPointerTo());
+    }
+
+    void emitScalarRetain(IRGenFunction &IGF, llvm::Value *value,
+                          Atomicity atomicity) const {
+      IGF.emitNativeUnownedRetain(value, atomicity);
+    }
+
+    void emitScalarRelease(IRGenFunction &IGF, llvm::Value *value,
+                           Atomicity atomicity) const {
+      IGF.emitNativeUnownedRelease(value, atomicity);
     }
 
     void emitScalarFixLifetime(IRGenFunction &IGF, llvm::Value *value) const {
       IGF.emitFixLifetime(value);
     }
     
-    // Unowned types have the same spare bits as strong heap object refs.
-    
-    bool mayHaveExtraInhabitants(IRGenModule &IGM) const override {
-      return true;
-    }
-
     unsigned getFixedExtraInhabitantCount(IRGenModule &IGM) const override {
-      return getHeapObjectExtraInhabitantCount(IGM);
+      return IGM.getUnownedExtraInhabitantCount(ReferenceCounting::Native);
     }
 
     APInt getFixedExtraInhabitantValue(IRGenModule &IGM,
                                        unsigned bits,
                                        unsigned index) const override {
-      return getHeapObjectFixedExtraInhabitantValue(IGM, bits, index, 0);
+      return IGM.getUnownedExtraInhabitantValue(bits, index,
+                                                ReferenceCounting::Native);
     }
 
     llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF, Address src,
-                                         SILType T)
-    const override {
-      return getHeapObjectExtraInhabitantIndex(IGF, src);
+                                         SILType T) const override {    
+      return IGF.getUnownedExtraInhabitantIndex(src,
+                                                ReferenceCounting::Native);
     }
 
     void storeExtraInhabitant(IRGenFunction &IGF, llvm::Value *index,
                               Address dest, SILType T) const override {
-      return storeHeapObjectExtraInhabitant(IGF, index, dest);
+      return IGF.storeUnownedExtraInhabitant(index, dest,
+                                             ReferenceCounting::Native);
+    }
+
+    APInt getFixedExtraInhabitantMask(IRGenModule &IGM) const override {
+      return IGM.getUnownedExtraInhabitantMask(ReferenceCounting::Native);
+
     }
   };
 
   /// A type implementation for a [weak] reference to an object
   /// with a known-Swift reference count.
-  class SwiftWeakReferenceTypeInfo
-    : public IndirectTypeInfo<SwiftWeakReferenceTypeInfo,
+  class NativeWeakReferenceTypeInfo
+    : public IndirectTypeInfo<NativeWeakReferenceTypeInfo,
                               WeakTypeInfo> {
     llvm::Type *ValueType;
   public:
-    SwiftWeakReferenceTypeInfo(llvm::Type *valueType,
-                               llvm::Type *weakType,
-                               Size size, Alignment alignment,
-                               SpareBitVector &&spareBits)
+    NativeWeakReferenceTypeInfo(llvm::Type *valueType,
+                                llvm::Type *weakType,
+                                Size size, Alignment alignment,
+                                SpareBitVector &&spareBits)
       : IndirectTypeInfo(weakType, size, alignment, std::move(spareBits)),
         ValueType(valueType) {}
 
     void initializeWithCopy(IRGenFunction &IGF, Address destAddr,
-                            Address srcAddr, SILType T) const override {
+                            Address srcAddr, SILType T,
+                            bool isOutlined) const override {
       IGF.emitNativeWeakCopyInit(destAddr, srcAddr);
     }
 
     void initializeWithTake(IRGenFunction &IGF, Address destAddr,
-                            Address srcAddr, SILType T) const override {
+                            Address srcAddr, SILType T,
+                            bool isOutlined) const override {
       IGF.emitNativeWeakTakeInit(destAddr, srcAddr);
     }
 
-    void assignWithCopy(IRGenFunction &IGF, Address destAddr,
-                        Address srcAddr, SILType T) const override {
+    void assignWithCopy(IRGenFunction &IGF, Address destAddr, Address srcAddr,
+                        SILType T, bool isOutlined) const override {
       IGF.emitNativeWeakCopyAssign(destAddr, srcAddr);
     }
 
-    void assignWithTake(IRGenFunction &IGF, Address destAddr,
-                        Address srcAddr, SILType T) const override {
+    void assignWithTake(IRGenFunction &IGF, Address destAddr, Address srcAddr,
+                        SILType T, bool isOutlined) const override {
       IGF.emitNativeWeakTakeAssign(destAddr, srcAddr);
     }
 
-    void destroy(IRGenFunction &IGF, Address addr, SILType T) const override {
+    void destroy(IRGenFunction &IGF, Address addr, SILType T,
+                 bool isOutlined) const override {
       IGF.emitNativeWeakDestroy(addr);
     }
 
@@ -509,24 +563,7 @@ namespace {
       IGF.emitNativeWeakAssign(value, dest);
     }
   };
-}
-
-const UnownedTypeInfo *
-TypeConverter::createSwiftUnownedStorageType(llvm::Type *valueType) {
-  return new SwiftUnownedReferenceTypeInfo(valueType,
-                                           IGM.getHeapObjectSpareBits(),
-                                           IGM.getPointerSize(),
-                                           IGM.getPointerAlignment());
-}
-
-const WeakTypeInfo *
-TypeConverter::createSwiftWeakStorageType(llvm::Type *valueType) {
-  return new SwiftWeakReferenceTypeInfo(valueType,
-                                    IGM.WeakReferencePtrTy->getElementType(),
-                                        IGM.getWeakReferenceSize(),
-                                        IGM.getWeakReferenceAlignment(),
-                                        IGM.getWeakReferenceSpareBits());
-}
+} // end anonymous namespace
 
 SpareBitVector IRGenModule::getWeakReferenceSpareBits() const {
   // The runtime needs to be able to freely manipulate live weak
@@ -536,57 +573,144 @@ SpareBitVector IRGenModule::getWeakReferenceSpareBits() const {
                                      false);
 }
 
+SpareBitVector
+IRGenModule::getUnownedReferenceSpareBits(ReferenceCounting style) const {
+  // If unknown references don't exist, we can just use the same rules as
+  // regular pointers.
+  if (!ObjCInterop) {
+    assert(style == ReferenceCounting::Native);
+    return getHeapObjectSpareBits();
+  }
+
+  // Otherwise, we have to be conservative (even with native
+  // reference-counting) in order to interoperate with code that might
+  // be working more generically with the memory/type.
+  return SpareBitVector::getConstant(getPointerSize().getValueInBits(), false);
+}
+
+unsigned IRGenModule::getUnownedExtraInhabitantCount(ReferenceCounting style) {
+  if (!ObjCInterop) {
+    assert(style == ReferenceCounting::Native);
+    return getHeapObjectExtraInhabitantCount(*this);
+  }
+
+  return 1;
+}
+
+APInt IRGenModule::getUnownedExtraInhabitantValue(unsigned bits, unsigned index,
+                                                  ReferenceCounting style) {
+  if (!ObjCInterop) {
+    assert(style == ReferenceCounting::Native);
+    return getHeapObjectFixedExtraInhabitantValue(*this, bits, index, 0);
+  }
+
+  assert(index == 0);
+  return APInt(bits, 0);
+}
+
+APInt IRGenModule::getUnownedExtraInhabitantMask(ReferenceCounting style) {
+  return APInt::getAllOnesValue(getPointerSize().getValueInBits());
+}
+
+llvm::Value *IRGenFunction::getUnownedExtraInhabitantIndex(Address src,
+                                                ReferenceCounting style) {
+  if (!IGM.ObjCInterop) {
+    assert(style == ReferenceCounting::Native);
+    return getHeapObjectExtraInhabitantIndex(*this, src);
+  }
+
+  assert(src.getAddress()->getType() == IGM.UnownedReferencePtrTy);
+  src = Builder.CreateStructGEP(src, 0, Size(0));
+  llvm::Value *ptr = Builder.CreateLoad(src);
+  llvm::Value *isNull = Builder.CreateIsNull(ptr);
+  llvm::Value *result =
+    Builder.CreateSelect(isNull, Builder.getInt32(0),
+                         llvm::ConstantInt::getSigned(IGM.Int32Ty, -1));
+  return result;
+}
+
+void IRGenFunction::storeUnownedExtraInhabitant(llvm::Value *index,
+                                                Address dest,
+                                                ReferenceCounting style) {
+  if (!IGM.ObjCInterop) {
+    assert(style == ReferenceCounting::Native);
+    return storeHeapObjectExtraInhabitant(*this, index, dest);
+  }
+
+  // Since there's only one legal extra inhabitant, it has to have
+  // the null pattern.
+  assert(dest.getAddress()->getType() == IGM.UnownedReferencePtrTy);
+  dest = Builder.CreateStructGEP(dest, 0, Size(0));
+  llvm::Value *null = llvm::ConstantPointerNull::get(IGM.RefCountedPtrTy);
+  Builder.CreateStore(null, dest);
+}
+
 namespace {
   /// A type implementation for an [unowned] reference to an object
   /// that is not necessarily a Swift object.
   class UnknownUnownedReferenceTypeInfo :
-      public SingleScalarTypeInfo<UnknownUnownedReferenceTypeInfo,
-                                  UnownedTypeInfo> {
+      public IndirectTypeInfo<UnknownUnownedReferenceTypeInfo, FixedTypeInfo> {
   public:
-    UnknownUnownedReferenceTypeInfo(llvm::Type *type,
-                                    const SpareBitVector &spareBits,
+    UnknownUnownedReferenceTypeInfo(llvm::Type *unownedType,
+                                    SpareBitVector &&spareBits,
                                     Size size, Alignment alignment)
-      : SingleScalarTypeInfo(type, size, spareBits, alignment) {}
-
-    enum { IsScalarPOD = false };
-
-    void emitScalarRetain(IRGenFunction &IGF, llvm::Value *value) const {
-      IGF.emitUnknownUnownedRetain(value);
+      : IndirectTypeInfo(unownedType, size, std::move(spareBits), alignment,
+                         IsNotPOD, IsNotBitwiseTakable, IsFixedSize) {
     }
 
-    void emitScalarRelease(IRGenFunction &IGF, llvm::Value *value) const {
-      IGF.emitUnknownUnownedRelease(value);
+    void assignWithCopy(IRGenFunction &IGF, Address dest, Address src,
+                        SILType type, bool isOutlined) const override {
+      IGF.emitUnknownUnownedCopyAssign(dest, src);
     }
 
-    void emitScalarFixLifetime(IRGenFunction &IGF, llvm::Value *value) const {
-      IGF.emitFixLifetime(value);
+    void initializeWithCopy(IRGenFunction &IGF, Address dest, Address src,
+                            SILType type, bool isOutlined) const override {
+      IGF.emitUnknownUnownedCopyInit(dest, src);
     }
+
+    void assignWithTake(IRGenFunction &IGF, Address dest, Address src,
+                        SILType type, bool isOutlined) const override {
+      IGF.emitUnknownUnownedTakeAssign(dest, src);
+    }
+
+    void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
+                            SILType type, bool isOutlined) const override {
+      IGF.emitUnknownUnownedTakeInit(dest, src);
+    }
+
+    void destroy(IRGenFunction &IGF, Address addr, SILType type,
+                 bool isOutlined) const override {
+      IGF.emitUnknownUnownedDestroy(addr);
+    }
+
+    // Unowned types have the same extra inhabitants as normal pointers.
+    // They do not, however, necessarily have any spare bits.
     
-    // Unowned types have the same spare bits as strong unknown object refs.
-    
-    bool mayHaveExtraInhabitants(IRGenModule &IGM) const override {
-      return true;
-    }
-
     unsigned getFixedExtraInhabitantCount(IRGenModule &IGM) const override {
-      return getHeapObjectExtraInhabitantCount(IGM);
+      return IGM.getUnownedExtraInhabitantCount(ReferenceCounting::Unknown);
     }
 
     APInt getFixedExtraInhabitantValue(IRGenModule &IGM,
                                        unsigned bits,
                                        unsigned index) const override {
-      return getHeapObjectFixedExtraInhabitantValue(IGM, bits, index, 0);
+      return IGM.getUnownedExtraInhabitantValue(bits, index,
+                                                ReferenceCounting::Unknown);
     }
 
     llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF, Address src,
-                                         SILType T)
-    const override {
-      return getHeapObjectExtraInhabitantIndex(IGF, src);
+                                         SILType T) const override {
+      return IGF.getUnownedExtraInhabitantIndex(src,
+                                                ReferenceCounting::Unknown);
     }
 
     void storeExtraInhabitant(IRGenFunction &IGF, llvm::Value *index,
                               Address dest, SILType T) const override {
-      return storeHeapObjectExtraInhabitant(IGF, index, dest);
+      return IGF.storeUnownedExtraInhabitant(index, dest,
+                                             ReferenceCounting::Unknown);
+    }
+
+    APInt getFixedExtraInhabitantMask(IRGenModule &IGM) const override {
+      return IGM.getUnownedExtraInhabitantMask(ReferenceCounting::Unknown);
     }
   };
 
@@ -607,26 +731,29 @@ namespace {
         ValueType(valueType) {}
 
     void initializeWithCopy(IRGenFunction &IGF, Address destAddr,
-                            Address srcAddr, SILType T) const override {
+                            Address srcAddr, SILType T,
+                            bool isOutlined) const override {
       IGF.emitUnknownWeakCopyInit(destAddr, srcAddr);
     }
 
     void initializeWithTake(IRGenFunction &IGF, Address destAddr,
-                            Address srcAddr, SILType T) const override {
+                            Address srcAddr, SILType T,
+                            bool isOutlined) const override {
       IGF.emitUnknownWeakTakeInit(destAddr, srcAddr);
     }
 
-    void assignWithCopy(IRGenFunction &IGF, Address destAddr,
-                        Address srcAddr, SILType T) const override {
+    void assignWithCopy(IRGenFunction &IGF, Address destAddr, Address srcAddr,
+                        SILType T, bool isOutlined) const override {
       IGF.emitUnknownWeakCopyAssign(destAddr, srcAddr);
     }
 
-    void assignWithTake(IRGenFunction &IGF, Address destAddr,
-                        Address srcAddr, SILType T) const override {
+    void assignWithTake(IRGenFunction &IGF, Address destAddr, Address srcAddr,
+                        SILType T, bool isOutlined) const override {
       IGF.emitUnknownWeakTakeAssign(destAddr, srcAddr);
     }
 
-    void destroy(IRGenFunction &IGF, Address addr, SILType T) const override {
+    void destroy(IRGenFunction &IGF, Address addr, SILType T,
+                 bool isOutlined) const override {
       IGF.emitUnknownWeakDestroy(addr);
     }
                                 
@@ -667,23 +794,55 @@ namespace {
       IGF.emitUnknownWeakAssign(value, dest);
     }
   };
+} // end anonymous namespace
+
+const TypeInfo *TypeConverter::createUnownedStorageType(llvm::Type *valueType,
+                                                      ReferenceCounting style) {
+  auto &&spareBits = IGM.getUnownedReferenceSpareBits(style);
+  switch (style) {
+  case ReferenceCounting::Native:
+    return new NativeUnownedReferenceTypeInfo(valueType,
+                                  IGM.UnownedReferencePtrTy->getElementType(),
+                                              std::move(spareBits),
+                                              IGM.getPointerSize(),
+                                              IGM.getPointerAlignment());
+  case ReferenceCounting::ObjC:
+  case ReferenceCounting::Block:
+  case ReferenceCounting::Unknown:
+    return new UnknownUnownedReferenceTypeInfo(
+                                  IGM.UnownedReferencePtrTy->getElementType(),
+                                               std::move(spareBits),
+                                               IGM.getPointerSize(),
+                                               IGM.getPointerAlignment());
+  case ReferenceCounting::Bridge:
+  case ReferenceCounting::Error:
+    llvm_unreachable("not supported!");
+  }
+  llvm_unreachable("bad reference-counting style");
 }
 
-const UnownedTypeInfo *
-TypeConverter::createUnknownUnownedStorageType(llvm::Type *valueType) {
-  return new UnknownUnownedReferenceTypeInfo(valueType,
-                                             IGM.getHeapObjectSpareBits(),
-                                             IGM.getPointerSize(),
-                                             IGM.getPointerAlignment());
-}
-
-const WeakTypeInfo *
-TypeConverter::createUnknownWeakStorageType(llvm::Type *valueType) {
-  return new UnknownWeakReferenceTypeInfo(valueType,
+const WeakTypeInfo *TypeConverter::createWeakStorageType(llvm::Type *valueType,
+                                                      ReferenceCounting style) {
+  switch (style) {
+  case ReferenceCounting::Native:
+    return new NativeWeakReferenceTypeInfo(valueType,
+                                    IGM.WeakReferencePtrTy->getElementType(),
+                                           IGM.getWeakReferenceSize(),
+                                           IGM.getWeakReferenceAlignment(),
+                                           IGM.getWeakReferenceSpareBits());
+  case ReferenceCounting::ObjC:
+  case ReferenceCounting::Block:
+  case ReferenceCounting::Unknown:
+    return new UnknownWeakReferenceTypeInfo(valueType,
                                       IGM.WeakReferencePtrTy->getElementType(),
-                                          IGM.getWeakReferenceSize(),
-                                          IGM.getWeakReferenceAlignment(),
-                                          IGM.getWeakReferenceSpareBits());
+                                            IGM.getWeakReferenceSize(),
+                                            IGM.getWeakReferenceAlignment(),
+                                            IGM.getWeakReferenceSpareBits());
+  case ReferenceCounting::Bridge:
+  case ReferenceCounting::Error:
+    llvm_unreachable("not supported!");
+  }
+  llvm_unreachable("bad reference-counting style");
 }
 
 /// Does the given value superficially not require reference-counting?
@@ -698,27 +857,38 @@ static llvm::FunctionType *getTypeOfFunction(llvm::Constant *fn) {
 
 /// Emit a unary call to perform a ref-counting operation.
 ///
-/// \param fn - expected signature 'void (T)'
+/// \param fn - expected signature 'void (T)' or 'T (T)'
 static void emitUnaryRefCountCall(IRGenFunction &IGF,
                                   llvm::Constant *fn,
                                   llvm::Value *value) {
+  auto cc = IGF.IGM.DefaultCC;
+  auto fun = dyn_cast<llvm::Function>(fn);
+  if (fun)
+    cc = fun->getCallingConv();
+
   // Instead of casting the input, we cast the function type.
   // This tends to produce less IR, but might be evil.
-  if (value->getType() != getTypeOfFunction(fn)->getParamType(0)) {
+  auto origFnType = getTypeOfFunction(fn);
+  if (value->getType() != origFnType->getParamType(0)) {
+    auto resultTy = origFnType->getReturnType() == IGF.IGM.VoidTy
+                        ? IGF.IGM.VoidTy
+                        : value->getType();
     llvm::FunctionType *fnType =
-      llvm::FunctionType::get(IGF.IGM.VoidTy, value->getType(), false);
+      llvm::FunctionType::get(resultTy, value->getType(), false);
     fn = llvm::ConstantExpr::getBitCast(fn, fnType->getPointerTo());
   }
   
   // Emit the call.
   llvm::CallInst *call = IGF.Builder.CreateCall(fn, value);
-  call->setCallingConv(IGF.IGM.RuntimeCC);
-  call->setDoesNotThrow();  
+  if (fun && fun->hasParamAttribute(0, llvm::Attribute::Returned))
+    call->addParamAttr(0, llvm::Attribute::Returned);
+  call->setCallingConv(cc);
+  call->setDoesNotThrow();
 }
 
 /// Emit a copy-like call to perform a ref-counting operation.
 ///
-/// \param fn - expected signature 'void (T, T)'
+/// \param fn - expected signature 'void (T, T)' or 'T (T, T)'
 static void emitCopyLikeCall(IRGenFunction &IGF,
                              llvm::Constant *fn,
                              llvm::Value *dest,
@@ -726,19 +896,30 @@ static void emitCopyLikeCall(IRGenFunction &IGF,
   assert(dest->getType() == src->getType() &&
          "type mismatch in binary refcounting operation");
 
+  auto cc = IGF.IGM.DefaultCC;
+  auto fun = dyn_cast<llvm::Function>(fn);
+  if (fun)
+    cc = fun->getCallingConv();
+
   // Instead of casting the inputs, we cast the function type.
   // This tends to produce less IR, but might be evil.
-  if (dest->getType() != getTypeOfFunction(fn)->getParamType(0)) {
+  auto origFnType = getTypeOfFunction(fn);
+  if (dest->getType() != origFnType->getParamType(0)) {
     llvm::Type *paramTypes[] = { dest->getType(), dest->getType() };
+    auto resultTy = origFnType->getReturnType() == IGF.IGM.VoidTy
+                        ? IGF.IGM.VoidTy
+                        : dest->getType();
     llvm::FunctionType *fnType =
-      llvm::FunctionType::get(IGF.IGM.VoidTy, paramTypes, false);
+      llvm::FunctionType::get(resultTy, paramTypes, false);
     fn = llvm::ConstantExpr::getBitCast(fn, fnType->getPointerTo());
   }
   
   // Emit the call.
   llvm::CallInst *call = IGF.Builder.CreateCall(fn, {dest, src});
-  call->setCallingConv(IGF.IGM.RuntimeCC);
-  call->setDoesNotThrow();  
+  if (fun && fun->hasParamAttribute(0, llvm::Attribute::Returned))
+    call->addParamAttr(0, llvm::Attribute::Returned);
+  call->setCallingConv(cc);
+  call->setDoesNotThrow();
 }
 
 /// Emit a call to a function with a loadWeak-like signature.
@@ -748,8 +929,14 @@ static llvm::Value *emitLoadWeakLikeCall(IRGenFunction &IGF,
                                          llvm::Constant *fn,
                                          llvm::Value *addr,
                                          llvm::Type *resultType) {
-  assert(addr->getType() == IGF.IGM.WeakReferencePtrTy &&
-         "address is not of a weak reference");
+  assert((addr->getType() == IGF.IGM.WeakReferencePtrTy ||
+          addr->getType() == IGF.IGM.UnownedReferencePtrTy) &&
+         "address is not of a weak or unowned reference");
+
+  auto cc = IGF.IGM.DefaultCC;
+  if (auto fun = dyn_cast<llvm::Function>(fn))
+    cc = fun->getCallingConv();
+
 
   // Instead of casting the output, we cast the function type.
   // This tends to produce less IR, but might be evil.
@@ -762,7 +949,7 @@ static llvm::Value *emitLoadWeakLikeCall(IRGenFunction &IGF,
 
   // Emit the call.
   llvm::CallInst *call = IGF.Builder.CreateCall(fn, addr);
-  call->setCallingConv(IGF.IGM.RuntimeCC);
+  call->setCallingConv(cc);
   call->setDoesNotThrow();
 
   return call;
@@ -770,43 +957,58 @@ static llvm::Value *emitLoadWeakLikeCall(IRGenFunction &IGF,
 
 /// Emit a call to a function with a storeWeak-like signature.
 ///
-/// \param fn - expected signature 'void (Weak*, T)'
+/// \param fn - expected signature 'void (Weak*, T)' or 'Weak* (Weak*, T)'
 static void emitStoreWeakLikeCall(IRGenFunction &IGF,
                                   llvm::Constant *fn,
                                   llvm::Value *addr,
                                   llvm::Value *value) {
-  assert(addr->getType() == IGF.IGM.WeakReferencePtrTy &&
-         "address is not of a weak reference");
+  assert((addr->getType() == IGF.IGM.WeakReferencePtrTy ||
+          addr->getType() == IGF.IGM.UnownedReferencePtrTy) &&
+         "address is not of a weak or unowned reference");
+
+  auto cc = IGF.IGM.DefaultCC;
+  auto fun = dyn_cast<llvm::Function>(fn);
+  if (fun)
+    cc = fun->getCallingConv();
 
   // Instead of casting the inputs, we cast the function type.
   // This tends to produce less IR, but might be evil.
-  if (value->getType() != getTypeOfFunction(fn)->getParamType(1)) {
+  auto origFnType = getTypeOfFunction(fn);
+  if (value->getType() != origFnType->getParamType(1)) {
     llvm::Type *paramTypes[] = { addr->getType(), value->getType() };
+    auto resultTy = origFnType->getReturnType() == IGF.IGM.VoidTy
+                        ? IGF.IGM.VoidTy
+                        : addr->getType();
     llvm::FunctionType *fnType =
-      llvm::FunctionType::get(IGF.IGM.VoidTy, paramTypes, false);
+      llvm::FunctionType::get(resultTy, paramTypes, false);
     fn = llvm::ConstantExpr::getBitCast(fn, fnType->getPointerTo());
   }
 
   // Emit the call.
   llvm::CallInst *call = IGF.Builder.CreateCall(fn, {addr, value});
-  call->setCallingConv(IGF.IGM.RuntimeCC);
+  if (fun && fun->hasParamAttribute(0, llvm::Attribute::Returned))
+    call->addParamAttr(0, llvm::Attribute::Returned);
+  call->setCallingConv(cc);
   call->setDoesNotThrow();
 }
 
 /// Emit a call to swift_retain.
-void IRGenFunction::emitNativeStrongRetain(llvm::Value *value) {
+void IRGenFunction::emitNativeStrongRetain(llvm::Value *value,
+                                           Atomicity atomicity) {
   if (doesNotRequireRefCounting(value))
     return;
 
   // Make sure the input pointer is the right type.
   if (value->getType() != IGM.RefCountedPtrTy)
     value = Builder.CreateBitCast(value, IGM.RefCountedPtrTy);
-  
+
   // Emit the call.
-  llvm::CallInst *call =
-    Builder.CreateCall(IGM.getNativeStrongRetainFn(), value);
-  call->setCallingConv(IGM.RuntimeCC);
+  llvm::CallInst *call = Builder.CreateCall(
+      (atomicity == Atomicity::Atomic) ? IGM.getNativeStrongRetainFn()
+                                       : IGM.getNativeNonAtomicStrongRetainFn(),
+      value);
   call->setDoesNotThrow();
+  call->addParamAttr(0, llvm::Attribute::Returned);
 }
 
 /// Emit a store of a live value to the given retaining variable.
@@ -819,7 +1021,7 @@ void IRGenFunction::emitNativeStrongAssign(llvm::Value *newValue,
   Builder.CreateStore(newValue, address);
 
   // Release the old value.
-  emitNativeStrongRelease(oldValue);
+  emitNativeStrongRelease(oldValue, getDefaultAtomicity());
 }
 
 /// Emit an initialize of a live value to the given retaining variable.
@@ -831,31 +1033,33 @@ void IRGenFunction::emitNativeStrongInit(llvm::Value *newValue,
 
 /// Emit a release of a live value with the given refcounting implementation.
 void IRGenFunction::emitStrongRelease(llvm::Value *value,
-                                      ReferenceCounting refcounting) {
+                                      ReferenceCounting refcounting,
+                                      Atomicity atomicity) {
   switch (refcounting) {
   case ReferenceCounting::Native:
-    return emitNativeStrongRelease(value);
+    return emitNativeStrongRelease(value, atomicity);
   case ReferenceCounting::ObjC:
     return emitObjCStrongRelease(value);
   case ReferenceCounting::Block:
     return emitBlockRelease(value);
   case ReferenceCounting::Unknown:
-    return emitUnknownStrongRelease(value);
+    return emitUnknownStrongRelease(value, atomicity);
   case ReferenceCounting::Bridge:
-    return emitBridgeStrongRelease(value);
+    return emitBridgeStrongRelease(value, atomicity);
   case ReferenceCounting::Error:
     return emitErrorStrongRelease(value);
   }
 }
 
 void IRGenFunction::emitStrongRetain(llvm::Value *value,
-                                     ReferenceCounting refcounting) {
+                                     ReferenceCounting refcounting,
+                                     Atomicity atomicity) {
   switch (refcounting) {
   case ReferenceCounting::Native:
-    emitNativeStrongRetain(value);
+    emitNativeStrongRetain(value, atomicity);
     return;
   case ReferenceCounting::Bridge:
-    emitBridgeStrongRetain(value);
+    emitBridgeStrongRetain(value, atomicity);
     return;
   case ReferenceCounting::ObjC:
     emitObjCStrongRetain(value);
@@ -864,7 +1068,7 @@ void IRGenFunction::emitStrongRetain(llvm::Value *value,
     emitBlockCopyCall(value);
     return;
   case ReferenceCounting::Unknown:
-    emitUnknownStrongRetain(value);
+    emitUnknownStrongRetain(value, atomicity);
     return;
   case ReferenceCounting::Error:
     emitErrorStrongRetain(value);
@@ -887,6 +1091,8 @@ llvm::Type *IRGenModule::getReferenceType(ReferenceCounting refcounting) {
   case ReferenceCounting::Error:
     return ErrorPtrTy;
   }
+
+  llvm_unreachable("Not a valid ReferenceCounting.");
 }
 
 #define DEFINE_BINARY_OPERATION(KIND, RESULT, TYPE1, TYPE2)                    \
@@ -941,110 +1147,208 @@ DEFINE_BINARY_OPERATION(UnownedAssign, void, llvm::Value *, Address)
 DEFINE_BINARY_OPERATION(UnownedLoadStrong, llvm::Value *, Address, llvm::Type *)
 DEFINE_BINARY_OPERATION(UnownedTakeStrong, llvm::Value *, Address, llvm::Type *)
 DEFINE_UNARY_OPERATION(UnownedDestroy, void, Address)
-DEFINE_UNARY_OPERATION(StrongRetainUnowned, void, llvm::Value *)
-DEFINE_UNARY_OPERATION(StrongRetainAndUnownedRelease, void, llvm::Value *)
-DEFINE_UNARY_OPERATION(UnownedRetain, void, llvm::Value *)
-DEFINE_UNARY_OPERATION(UnownedRelease, void, llvm::Value *)
 
 #undef DEFINE_UNARY_OPERATION
 #undef DEFINE_BINARY_OPERATION
 
+void IRGenFunction::emitUnownedRetain(llvm::Value *value,
+                                      ReferenceCounting style,
+                                      Atomicity atomicity) {
+  assert(style == ReferenceCounting::Native &&
+         "only native references support scalar unowned reference-counting");
+  emitNativeUnownedRetain(value, atomicity);
+}
+
+void IRGenFunction::emitUnownedRelease(llvm::Value *value,
+                                       ReferenceCounting style,
+                                       Atomicity atomicity) {
+  assert(style == ReferenceCounting::Native &&
+         "only native references support scalar unowned reference-counting");
+  emitNativeUnownedRelease(value, atomicity);
+}
+
+void IRGenFunction::emitStrongRetainUnowned(llvm::Value *value,
+                                            ReferenceCounting style,
+                                            Atomicity atomicity) {
+  assert(style == ReferenceCounting::Native &&
+         "only native references support scalar unowned reference-counting");
+  emitNativeStrongRetainUnowned(value, atomicity);
+}
+
+void IRGenFunction::emitStrongRetainAndUnownedRelease(llvm::Value *value,
+                                                      ReferenceCounting style,
+                                                      Atomicity atomicity) {
+  assert(style == ReferenceCounting::Native &&
+         "only native references support scalar unowned reference-counting");
+  emitNativeStrongRetainAndUnownedRelease(value, atomicity);
+}
+
 /// Emit a release of a live value.
-void IRGenFunction::emitNativeStrongRelease(llvm::Value *value) {
+void IRGenFunction::emitNativeStrongRelease(llvm::Value *value,
+                                            Atomicity atomicity) {
+  if (doesNotRequireRefCounting(value))
+    return;
+  emitUnaryRefCountCall(*this, (atomicity == Atomicity::Atomic)
+                                   ? IGM.getNativeStrongReleaseFn()
+                                   : IGM.getNativeNonAtomicStrongReleaseFn(),
+                        value);
+}
+
+void IRGenFunction::emitNativeSetDeallocating(llvm::Value *value) {
   if (doesNotRequireRefCounting(value)) return;
-  emitUnaryRefCountCall(*this, IGM.getNativeStrongReleaseFn(), value);
+  emitUnaryRefCountCall(*this, IGM.getNativeSetDeallocatingFn(), value);
 }
 
 void IRGenFunction::emitNativeUnownedInit(llvm::Value *value,
                                           Address dest) {
+  value = Builder.CreateBitCast(value, IGM.RefCountedPtrTy);
+  dest = Builder.CreateStructGEP(dest, 0, Size(0));
   Builder.CreateStore(value, dest);
-  emitNativeUnownedRetain(value);
+  emitNativeUnownedRetain(value, getDefaultAtomicity());
 }
 
 void IRGenFunction::emitNativeUnownedAssign(llvm::Value *value,
                                             Address dest) {
+  value = Builder.CreateBitCast(value, IGM.RefCountedPtrTy);
+  dest = Builder.CreateStructGEP(dest, 0, Size(0));
   auto oldValue = Builder.CreateLoad(dest);
   Builder.CreateStore(value, dest);
-  emitNativeUnownedRetain(value);
-  emitNativeUnownedRelease(oldValue);
+  emitNativeUnownedRetain(value, getDefaultAtomicity());
+  emitNativeUnownedRelease(oldValue, getDefaultAtomicity());
 }
 
 llvm::Value *IRGenFunction::emitNativeUnownedLoadStrong(Address src,
                                                         llvm::Type *type) {
+  src = Builder.CreateStructGEP(src, 0, Size(0));
   llvm::Value *value = Builder.CreateLoad(src);
   value = Builder.CreateBitCast(value, type);
-  emitNativeStrongRetainUnowned(value);
+  emitNativeStrongRetainUnowned(value, getDefaultAtomicity());
   return value;
 }
 
 llvm::Value *IRGenFunction::emitNativeUnownedTakeStrong(Address src,
                                                         llvm::Type *type) {
+  src = Builder.CreateStructGEP(src, 0, Size(0));
   llvm::Value *value = Builder.CreateLoad(src);
   value = Builder.CreateBitCast(value, type);
-  emitNativeStrongRetainAndUnownedRelease(value);
+  emitNativeStrongRetainAndUnownedRelease(value, getDefaultAtomicity());
   return value;
 }
 
 void IRGenFunction::emitNativeUnownedDestroy(Address ref) {
+  ref = Builder.CreateStructGEP(ref, 0, Size(0));
   llvm::Value *value = Builder.CreateLoad(ref);
-  emitNativeUnownedRelease(value);
+  emitNativeUnownedRelease(value, getDefaultAtomicity());
 }
 
 void IRGenFunction::emitNativeUnownedCopyInit(Address dest, Address src) {
+  src = Builder.CreateStructGEP(src, 0, Size(0));
+  dest = Builder.CreateStructGEP(dest, 0, Size(0));
   llvm::Value *newValue = Builder.CreateLoad(src);
   Builder.CreateStore(newValue, dest);
-  emitNativeUnownedRetain(newValue);
+  emitNativeUnownedRetain(newValue, getDefaultAtomicity());
 }
 
 void IRGenFunction::emitNativeUnownedTakeInit(Address dest, Address src) {
+  src = Builder.CreateStructGEP(src, 0, Size(0));
+  dest = Builder.CreateStructGEP(dest, 0, Size(0));
   llvm::Value *newValue = Builder.CreateLoad(src);
   Builder.CreateStore(newValue, dest);
 }
 
 void IRGenFunction::emitNativeUnownedCopyAssign(Address dest, Address src) {
+  src = Builder.CreateStructGEP(src, 0, Size(0));
+  dest = Builder.CreateStructGEP(dest, 0, Size(0));
   llvm::Value *newValue = Builder.CreateLoad(src);
   llvm::Value *oldValue = Builder.CreateLoad(dest);
   Builder.CreateStore(newValue, dest);
-  emitNativeUnownedRetain(newValue);
-  emitNativeUnownedRelease(oldValue);
+  emitNativeUnownedRetain(newValue, getDefaultAtomicity());
+  emitNativeUnownedRelease(oldValue, getDefaultAtomicity());
 }
 
 void IRGenFunction::emitNativeUnownedTakeAssign(Address dest, Address src) {
+  src = Builder.CreateStructGEP(src, 0, Size(0));
+  dest = Builder.CreateStructGEP(dest, 0, Size(0));
   llvm::Value *newValue = Builder.CreateLoad(src);
   llvm::Value *oldValue = Builder.CreateLoad(dest);
   Builder.CreateStore(newValue, dest);
-  emitNativeUnownedRelease(oldValue);
+  emitNativeUnownedRelease(oldValue, getDefaultAtomicity());
+}
+
+llvm::Constant *IRGenModule::getFixLifetimeFn() {
+  if (FixLifetimeFn)
+    return FixLifetimeFn;
+  
+  // Generate a private stub function for the LLVM ARC optimizer to recognize.
+  auto fixLifetimeTy = llvm::FunctionType::get(VoidTy, RefCountedPtrTy,
+                                               /*isVarArg*/ false);
+  auto fixLifetime = llvm::Function::Create(fixLifetimeTy,
+                                         llvm::GlobalValue::PrivateLinkage,
+                                         "__swift_fixLifetime",
+                                         &Module);
+  assert(fixLifetime->getName().equals("__swift_fixLifetime")
+         && "fixLifetime symbol name got mangled?!");
+  // Don't inline the function, so it stays as a signal to the ARC passes.
+  // The ARC passes will remove references to the function when they're
+  // no longer needed.
+  fixLifetime->addAttribute(llvm::AttributeList::FunctionIndex,
+                            llvm::Attribute::NoInline);
+
+  // Give the function an empty body.
+  auto entry = llvm::BasicBlock::Create(LLVMContext, "", fixLifetime);
+  llvm::ReturnInst::Create(LLVMContext, entry);
+  
+  FixLifetimeFn = fixLifetime;
+  return fixLifetime;
 }
 
 /// Fix the lifetime of a live value. This communicates to the LLVM level ARC
 /// optimizer not to touch this value.
 void IRGenFunction::emitFixLifetime(llvm::Value *value) {
+  // If we aren't running the LLVM ARC optimizer, we don't need to emit this.
+  if (!IGM.IRGen.Opts.shouldOptimize() ||
+      IGM.IRGen.Opts.DisableSwiftSpecificLLVMOptzns)
+    return;
   if (doesNotRequireRefCounting(value)) return;
   emitUnaryRefCountCall(*this, IGM.getFixLifetimeFn(), value);
 }
 
-void IRGenFunction::emitUnknownStrongRetain(llvm::Value *value) {
-  if (doesNotRequireRefCounting(value)) return;
-  emitUnaryRefCountCall(*this, IGM.getUnknownRetainFn(), value);
+void IRGenFunction::emitUnknownStrongRetain(llvm::Value *value,
+                                            Atomicity atomicity) {
+  if (doesNotRequireRefCounting(value))
+    return;
+  emitUnaryRefCountCall(*this, (atomicity == Atomicity::Atomic)
+                                   ? IGM.getUnknownRetainFn()
+                                   : IGM.getNonAtomicUnknownRetainFn(),
+                        value);
 }
 
-void IRGenFunction::emitUnknownStrongRelease(llvm::Value *value) {
-  if (doesNotRequireRefCounting(value)) return;
-  emitUnaryRefCountCall(*this, IGM.getUnknownReleaseFn(), value);
+void IRGenFunction::emitUnknownStrongRelease(llvm::Value *value,
+                                             Atomicity atomicity) {
+  if (doesNotRequireRefCounting(value))
+    return;
+  emitUnaryRefCountCall(*this, (atomicity == Atomicity::Atomic)
+                                   ? IGM.getUnknownReleaseFn()
+                                   : IGM.getNonAtomicUnknownReleaseFn(),
+                        value);
 }
 
-// FIXME: irrevocably broken
-void IRGenFunction::emitUnknownStrongRetainAndUnownedRelease(llvm::Value *ref) {
-  emitUnknownStrongRetain(ref);
-  emitUnknownUnownedRelease(ref);
+void IRGenFunction::emitBridgeStrongRetain(llvm::Value *value,
+                                           Atomicity atomicity) {
+  emitUnaryRefCountCall(*this,
+                        (atomicity == Atomicity::Atomic)
+                            ? IGM.getBridgeObjectStrongRetainFn()
+                            : IGM.getNonAtomicBridgeObjectStrongRetainFn(),
+                        value);
 }
 
-void IRGenFunction::emitBridgeStrongRetain(llvm::Value *value) {
-  emitUnaryRefCountCall(*this, IGM.getBridgeObjectStrongRetainFn(), value);
-}
-
-void IRGenFunction::emitBridgeStrongRelease(llvm::Value *value) {
-  emitUnaryRefCountCall(*this, IGM.getBridgeObjectStrongReleaseFn(), value);
+void IRGenFunction::emitBridgeStrongRelease(llvm::Value *value,
+                                            Atomicity atomicity) {
+  emitUnaryRefCountCall(*this,
+                        (atomicity == Atomicity::Atomic)
+                            ? IGM.getBridgeObjectStrongReleaseFn()
+                            : IGM.getNonAtomicBridgeObjectStrongReleaseFn(),
+                        value);
 }
 
 void IRGenFunction::emitErrorStrongRetain(llvm::Value *value) {
@@ -1055,9 +1359,12 @@ void IRGenFunction::emitErrorStrongRelease(llvm::Value *value) {
   emitUnaryRefCountCall(*this, IGM.getErrorStrongReleaseFn(), value);
 }
 
-llvm::Value *IRGenFunction::emitNativeTryPin(llvm::Value *value) {
-  llvm::CallInst *call = Builder.CreateCall(IGM.getNativeTryPinFn(), value);
-  call->setCallingConv(IGM.RuntimeCC);
+llvm::Value *IRGenFunction::emitNativeTryPin(llvm::Value *value,
+                                             Atomicity atomicity) {
+  llvm::CallInst *call =
+      (atomicity == Atomicity::Atomic)
+          ? Builder.CreateCall(IGM.getNativeTryPinFn(), value)
+          : Builder.CreateCall(IGM.getNonAtomicNativeTryPinFn(), value);
   call->setDoesNotThrow();
 
   // Builtin.NativeObject? has representation i32/i64.
@@ -1065,30 +1372,21 @@ llvm::Value *IRGenFunction::emitNativeTryPin(llvm::Value *value) {
   return handle;
 }
 
-void IRGenFunction::emitNativeUnpin(llvm::Value *value) {
+void IRGenFunction::emitNativeUnpin(llvm::Value *value, Atomicity atomicity) {
   // Builtin.NativeObject? has representation i32/i64.
   value = Builder.CreateIntToPtr(value, IGM.RefCountedPtrTy);
 
-  llvm::CallInst *call = Builder.CreateCall(IGM.getNativeUnpinFn(), value);
-  call->setCallingConv(IGM.RuntimeCC);
+  llvm::CallInst *call =
+      (atomicity == Atomicity::Atomic)
+          ? Builder.CreateCall(IGM.getNativeUnpinFn(), value)
+          : Builder.CreateCall(IGM.getNonAtomicNativeUnpinFn(), value);
   call->setDoesNotThrow();
 }
 
-llvm::Value *IRGenFunction::emitLoadNativeRefcountedPtr(Address addr) {
+llvm::Value *IRGenFunction::emitLoadRefcountedPtr(Address addr,
+                                                  ReferenceCounting style) {
   Address src =
-    Builder.CreateBitCast(addr, IGM.RefCountedPtrTy->getPointerTo());
-  return Builder.CreateLoad(src);
-}
-
-llvm::Value *IRGenFunction::emitLoadUnknownRefcountedPtr(Address addr) {
-  Address src =
-    Builder.CreateBitCast(addr, IGM.UnknownRefCountedPtrTy->getPointerTo());
-  return Builder.CreateLoad(src);
-}
-
-llvm::Value *IRGenFunction::emitLoadBridgeRefcountedPtr(Address addr) {
-  Address src =
-    Builder.CreateBitCast(addr, IGM.BridgeObjectPtrTy->getPointerTo());
+    Builder.CreateBitCast(addr, IGM.getReferenceType(style)->getPointerTo());
   return Builder.CreateLoad(src);
 }
 
@@ -1134,7 +1432,22 @@ emitIsUniqueCall(llvm::Value *value, SourceLoc loc, bool isNonNull,
     llvm_unreachable("Unexpected LLVM type for a refcounted pointer.");
   }
   llvm::CallInst *call = Builder.CreateCall(fn, value);
-  call->setCallingConv(IGM.RuntimeCC);
+  call->setDoesNotThrow();
+  return call;
+}
+
+llvm::Value *IRGenFunction::emitIsEscapingClosureCall(
+    llvm::Value *value, SourceLoc sourceLoc, unsigned verificationType) {
+  auto loc = SILLocation::decode(sourceLoc, IGM.Context.SourceMgr);
+  auto line = llvm::ConstantInt::get(IGM.Int32Ty, loc.Line);
+  auto col = llvm::ConstantInt::get(IGM.Int32Ty, loc.Column);
+  auto filename = IGM.getAddrOfGlobalString(loc.Filename);
+  auto filenameLength =
+      llvm::ConstantInt::get(IGM.Int32Ty, loc.Filename.size());
+  auto type = llvm::ConstantInt::get(IGM.Int32Ty, verificationType);
+  llvm::CallInst *call =
+      Builder.CreateCall(IGM.getIsEscapingClosureAtFileLocationFn(),
+                         {value, filename, filenameLength, line, col, type});
   call->setDoesNotThrow();
   return call;
 }
@@ -1155,7 +1468,7 @@ public:
 
   /// Allocate a box of the given type.
   virtual OwnedAddress
-  allocate(IRGenFunction &IGF, SILType boxedType,
+  allocate(IRGenFunction &IGF, SILType boxedType, GenericEnvironment *env,
            const llvm::Twine &name) const = 0;
 
   /// Deallocate an uninitialized box.
@@ -1173,10 +1486,10 @@ public:
   EmptyBoxTypeInfo(IRGenModule &IGM) : BoxTypeInfo(IGM) {}
 
   OwnedAddress
-  allocate(IRGenFunction &IGF, SILType boxedType,
+  allocate(IRGenFunction &IGF, SILType boxedType, GenericEnvironment *env,
            const llvm::Twine &name) const override {
     return OwnedAddress(IGF.getTypeInfo(boxedType).getUndefAddress(),
-                        IGF.IGM.RefCountedNull);
+                        IGF.emitAllocEmptyBoxCall());
   }
 
   void
@@ -1198,7 +1511,7 @@ public:
   NonFixedBoxTypeInfo(IRGenModule &IGM) : BoxTypeInfo(IGM) {}
 
   OwnedAddress
-  allocate(IRGenFunction &IGF, SILType boxedType,
+  allocate(IRGenFunction &IGF, SILType boxedType, GenericEnvironment *env,
            const llvm::Twine &name) const override {
     auto &ti = IGF.getTypeInfo(boxedType);
     // Use the runtime to allocate a box of the appropriate size.
@@ -1239,10 +1552,22 @@ public:
   {}
 
   OwnedAddress
-  allocate(IRGenFunction &IGF, SILType boxedType, const llvm::Twine &name)
+  allocate(IRGenFunction &IGF, SILType boxedType, GenericEnvironment *env,
+           const llvm::Twine &name)
   const override {
     // Allocate a new object using the layout.
-    llvm::Value *allocation = IGF.emitUnmanagedAlloc(layout, name);
+    auto boxedInterfaceType = boxedType;
+    if (env) {
+      boxedInterfaceType = SILType::getPrimitiveType(
+        boxedType.getASTType()->mapTypeOutOfContext()
+           ->getCanonicalType(),
+         boxedType.getCategory());
+    }
+
+    auto boxDescriptor = IGF.IGM.getAddrOfBoxDescriptor(
+        boxedInterfaceType.getASTType());
+    llvm::Value *allocation = IGF.emitUnmanagedAlloc(layout, name,
+                                                     boxDescriptor);
     Address rawAddr = project(IGF, allocation, boxedType);
     return {rawAddr, allocation};
   }
@@ -1253,7 +1578,7 @@ public:
     auto size = layout.emitSize(IGF.IGM);
     auto alignMask = layout.emitAlignMask(IGF.IGM);
 
-    emitDeallocateHeapObject(IGF, box, size, alignMask);
+    emitDeallocateUninitializedHeapObject(IGF, box, size, alignMask);
   }
 
   Address
@@ -1300,11 +1625,15 @@ public:
   {}
 };
 
-}
+} // end anonymous namespace
 
 const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   // We can share a type info for all dynamic-sized heap metadata.
-  auto &eltTI = IGM.getTypeInfoForLowered(T->getBoxedType());
+  // TODO: Multi-field boxes
+  assert(T->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  auto &eltTI = IGM.getTypeInfoForLowered(
+    T->getFieldLoweredType(IGM.getSILModule(), 0));
   if (!eltTI.isFixedSize()) {
     if (!NonFixedBoxTI)
       NonFixedBoxTI = new NonFixedBoxTypeInfo(IGM);
@@ -1314,15 +1643,19 @@ const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   // For fixed-sized types, we can emit concrete box metadata.
   auto &fixedTI = cast<FixedTypeInfo>(eltTI);
 
-  // For empty types, we don't really need to allocate anything.
-  if (fixedTI.isKnownEmpty()) {
+  // Because we assume in enum's that payloads with a Builtin.NativeObject which
+  // is also the type for indirect enum cases have extra inhabitants of pointers
+  // we can't have a nil pointer as a representation for an empty box type --
+  // nil conflicts with the extra inhabitants. We return a static singleton
+  // empty box object instead.
+  if (fixedTI.isKnownEmpty(ResilienceExpansion::Maximal)) {
     if (!EmptyBoxTI)
       EmptyBoxTI = new EmptyBoxTypeInfo(IGM);
     return EmptyBoxTI;
   }
 
   // We can share box info for all similarly-shaped POD types.
-  if (fixedTI.isPOD(ResilienceScope::Component)) {
+  if (fixedTI.isPOD(ResilienceExpansion::Maximal)) {
     auto stride = fixedTI.getFixedStride();
     auto align = fixedTI.getFixedAlignment();
     auto foundPOD = PODBoxTI.find({stride.getValue(),align.getValue()});
@@ -1336,7 +1669,7 @@ const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   }
 
   // We can share box info for all single-refcounted types.
-  if (fixedTI.isSingleSwiftRetainablePointer(ResilienceScope::Component)) {
+  if (fixedTI.isSingleSwiftRetainablePointer(ResilienceExpansion::Maximal)) {
     if (!SwiftRetainablePointerBoxTI)
       SwiftRetainablePointerBoxTI
         = new SingleRefcountedBoxTypeInfo(IGM, ReferenceCounting::Native);
@@ -1346,34 +1679,67 @@ const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   // TODO: Other common shapes? Optional-of-Refcounted would be nice.
 
   // Produce a tailored box metadata for the type.
-  return new FixedBoxTypeInfo(IGM, T->getBoxedAddressType());
+  assert(T->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  return new FixedBoxTypeInfo(IGM, T->getFieldType(IGM.getSILModule(), 0));
 }
 
 OwnedAddress
 irgen::emitAllocateBox(IRGenFunction &IGF, CanSILBoxType boxType,
+                       GenericEnvironment *env,
                        const llvm::Twine &name) {
   auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
-  return boxTI.allocate(IGF, boxType->getBoxedAddressType(), name);
+  assert(boxType->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  return boxTI.allocate(IGF,
+                      boxType->getFieldType(IGF.IGM.getSILModule(), 0), env,
+                      name);
 }
 
 void irgen::emitDeallocateBox(IRGenFunction &IGF,
                               llvm::Value *box,
                               CanSILBoxType boxType) {
   auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
-  return boxTI.deallocate(IGF, box, boxType->getBoxedAddressType());
+  assert(boxType->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  return boxTI.deallocate(IGF, box,
+                          boxType->getFieldType(IGF.IGM.getSILModule(), 0));
 }
 
 Address irgen::emitProjectBox(IRGenFunction &IGF,
                               llvm::Value *box,
                               CanSILBoxType boxType) {
   auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
-  return boxTI.project(IGF, box, boxType->getBoxedAddressType());
+  assert(boxType->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  return boxTI.project(IGF, box,
+                       boxType->getFieldType(IGF.IGM.getSILModule(), 0));
+}
+
+Address irgen::emitAllocateExistentialBoxInBuffer(
+    IRGenFunction &IGF, SILType boxedType, Address destBuffer,
+    GenericEnvironment *env, const llvm::Twine &name, bool isOutlined) {
+  // Get a box for the boxed value.
+  auto boxType = SILBoxType::get(boxedType.getASTType());
+  auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
+  OwnedAddress owned = boxTI.allocate(IGF, boxedType, env, name);
+  Explosion box;
+  box.add(owned.getOwner());
+  boxTI.initialize(IGF, box,
+                   Address(IGF.Builder.CreateBitCast(
+                               destBuffer.getAddress(),
+                               owned.getOwner()->getType()->getPointerTo()),
+                           destBuffer.getAlignment()),
+                   isOutlined);
+  return owned.getAddress();
 }
 
 #define DEFINE_VALUE_OP(ID)                                           \
-void IRGenFunction::emit##ID(llvm::Value *value) {                    \
+void IRGenFunction::emit##ID(llvm::Value *value, Atomicity atomicity) { \
   if (doesNotRequireRefCounting(value)) return;                       \
-  emitUnaryRefCountCall(*this, IGM.get##ID##Fn(), value);             \
+  emitUnaryRefCountCall(*this, (atomicity == Atomicity::Atomic)       \
+                        ? IGM.get##ID##Fn() : IGM.getNonAtomic##ID##Fn(), \
+                        value);                                       \
 }
 #define DEFINE_ADDR_OP(ID)                                            \
 void IRGenFunction::emit##ID(Address addr) {                          \
@@ -1408,9 +1774,6 @@ DEFINE_COPY_OP(NativeWeakCopyInit)
 DEFINE_COPY_OP(NativeWeakCopyAssign)
 DEFINE_COPY_OP(NativeWeakTakeInit)
 DEFINE_COPY_OP(NativeWeakTakeAssign)
-DEFINE_VALUE_OP(UnknownStrongRetainUnowned) // FIXME: irrevocably broken
-DEFINE_VALUE_OP(UnknownUnownedRelease)      // FIXME: irrevocably broken
-DEFINE_VALUE_OP(UnknownUnownedRetain)       // FIXME: irrevocably broken
 DEFINE_LOAD_WEAK_OP(UnknownUnownedLoadStrong)
 DEFINE_LOAD_WEAK_OP(UnknownUnownedTakeStrong)
 DEFINE_STORE_WEAK_OP(UnknownUnownedInit)
@@ -1429,3 +1792,247 @@ DEFINE_COPY_OP(UnknownWeakCopyInit)
 DEFINE_COPY_OP(UnknownWeakCopyAssign)
 DEFINE_COPY_OP(UnknownWeakTakeInit)
 DEFINE_COPY_OP(UnknownWeakTakeAssign)
+
+llvm::Value *IRGenFunction::getLocalSelfMetadata() {
+  assert(LocalSelf && "no local self metadata");
+  switch (SelfKind) {
+  case SwiftMetatype:
+    return LocalSelf;
+  case ObjCMetatype:
+    return emitObjCMetadataRefForMetadata(*this, LocalSelf);
+  case ObjectReference:
+    return emitDynamicTypeOfOpaqueHeapObject(*this, LocalSelf,
+                                             MetatypeRepresentation::Thick);
+  }
+
+  llvm_unreachable("Not a valid LocalSelfKind.");
+}
+
+/// Given a non-tagged object pointer, load a pointer to its class object.
+llvm::Value *irgen::emitLoadOfObjCHeapMetadataRef(IRGenFunction &IGF,
+                                                  llvm::Value *object) {
+  if (IGF.IGM.TargetInfo.hasISAMasking()) {
+    object = IGF.Builder.CreateBitCast(object,
+                                       IGF.IGM.IntPtrTy->getPointerTo());
+    llvm::Value *metadata =
+      IGF.Builder.CreateLoad(Address(object, IGF.IGM.getPointerAlignment()));
+    llvm::Value *mask = IGF.Builder.CreateLoad(IGF.IGM.getAddrOfObjCISAMask());
+    metadata = IGF.Builder.CreateAnd(metadata, mask);
+    metadata = IGF.Builder.CreateIntToPtr(metadata, IGF.IGM.TypeMetadataPtrTy);
+    return metadata;
+  } else if (IGF.IGM.TargetInfo.hasOpaqueISAs()) {
+    return emitHeapMetadataRefForUnknownHeapObject(IGF, object);
+  } else {
+    object = IGF.Builder.CreateBitCast(object,
+                                  IGF.IGM.TypeMetadataPtrTy->getPointerTo());
+    llvm::Value *metadata =
+      IGF.Builder.CreateLoad(Address(object, IGF.IGM.getPointerAlignment()));
+    return metadata;
+  }
+}
+
+/// Given a pointer to a heap object (i.e. definitely not a tagged
+/// pointer), load its heap metadata pointer.
+static llvm::Value *emitLoadOfHeapMetadataRef(IRGenFunction &IGF,
+                                              llvm::Value *object,
+                                              IsaEncoding isaEncoding,
+                                              bool suppressCast) {
+  switch (isaEncoding) {
+  case IsaEncoding::Pointer: {
+    // Drill into the object pointer.  Rather than bitcasting, we make
+    // an effort to do something that should explode if we get something
+    // mistyped.
+    llvm::StructType *structTy =
+      cast<llvm::StructType>(
+        cast<llvm::PointerType>(object->getType())->getElementType());
+
+    llvm::Value *slot;
+
+    // We need a bitcast if we're dealing with an opaque class.
+    if (structTy->isOpaque()) {
+      auto metadataPtrPtrTy = IGF.IGM.TypeMetadataPtrTy->getPointerTo();
+      slot = IGF.Builder.CreateBitCast(object, metadataPtrPtrTy);
+
+    // Otherwise, make a GEP.
+    } else {
+      auto zero = llvm::ConstantInt::get(IGF.IGM.Int32Ty, 0);
+
+      SmallVector<llvm::Value*, 4> indexes;
+      indexes.push_back(zero);
+      do {
+        indexes.push_back(zero);
+
+        // Keep drilling down to the first element type.
+        auto eltTy = structTy->getElementType(0);
+        assert(isa<llvm::StructType>(eltTy) || eltTy == IGF.IGM.TypeMetadataPtrTy);
+        structTy = dyn_cast<llvm::StructType>(eltTy);
+      } while (structTy != nullptr);
+
+      slot = IGF.Builder.CreateInBoundsGEP(object, indexes);
+
+      if (!suppressCast) {
+        slot = IGF.Builder.CreateBitCast(slot,
+                                    IGF.IGM.TypeMetadataPtrTy->getPointerTo());
+      }
+    }
+
+    auto metadata = IGF.Builder.CreateLoad(Address(slot,
+                                               IGF.IGM.getPointerAlignment()));
+    if (IGF.IGM.EnableValueNames && object->hasName())
+      metadata->setName(llvm::Twine(object->getName()) + ".metadata");
+    return metadata;
+  }
+      
+  case IsaEncoding::ObjC: {
+    // Feed the object pointer to object_getClass.
+    llvm::Value *objcClass = emitLoadOfObjCHeapMetadataRef(IGF, object);
+    objcClass = IGF.Builder.CreateBitCast(objcClass, IGF.IGM.TypeMetadataPtrTy);
+    return objcClass;
+  }
+  }
+
+  llvm_unreachable("Not a valid IsaEncoding.");
+}
+
+/// Given an object of class type, produce the heap metadata reference
+/// as an %objc_class*.
+llvm::Value *irgen::emitHeapMetadataRefForHeapObject(IRGenFunction &IGF,
+                                                     llvm::Value *object,
+                                                     CanType objectType,
+                                                     bool suppressCast) {
+  ClassDecl *theClass = objectType.getClassOrBoundGenericClass();
+  if (theClass && isKnownNotTaggedPointer(IGF.IGM, theClass))
+    return emitLoadOfHeapMetadataRef(IGF, object,
+                                     getIsaEncodingForType(IGF.IGM, objectType),
+                                     suppressCast);
+
+  // OK, ask the runtime for the class pointer of this potentially-ObjC object.
+  return emitHeapMetadataRefForUnknownHeapObject(IGF, object);
+}
+
+llvm::Value *irgen::emitHeapMetadataRefForHeapObject(IRGenFunction &IGF,
+                                                     llvm::Value *object,
+                                                     SILType objectType,
+                                                     bool suppressCast) {
+  return emitHeapMetadataRefForHeapObject(IGF, object,
+                                          objectType.getASTType(),
+                                          suppressCast);
+}
+
+/// Given an opaque class instance pointer, produce the type metadata reference
+/// as a %type*.
+llvm::Value *irgen::emitDynamicTypeOfOpaqueHeapObject(IRGenFunction &IGF,
+                                                  llvm::Value *object,
+                                                  MetatypeRepresentation repr) {
+  object = IGF.Builder.CreateBitCast(object, IGF.IGM.ObjCPtrTy);
+  llvm::CallInst *metadata;
+  
+  switch (repr) {
+  case MetatypeRepresentation::ObjC:
+    metadata = IGF.Builder.CreateCall(IGF.IGM.getGetObjCClassFromObjectFn(),
+                                      object,
+                                      object->getName() + ".Type");
+    break;
+  case MetatypeRepresentation::Thick:
+    metadata = IGF.Builder.CreateCall(IGF.IGM.getGetObjectTypeFn(),
+                                      object,
+                                      object->getName() + ".Type");
+    break;
+  case MetatypeRepresentation::Thin:
+    llvm_unreachable("class metadata can't be thin");
+  }
+  
+  metadata->setDoesNotThrow();
+  metadata->setOnlyReadsMemory();
+  return metadata;
+}
+
+llvm::Value *irgen::
+emitHeapMetadataRefForUnknownHeapObject(IRGenFunction &IGF,
+                                        llvm::Value *object) {
+  object = IGF.Builder.CreateBitCast(object, IGF.IGM.ObjCPtrTy);
+  auto metadata = IGF.Builder.CreateCall(IGF.IGM.getGetObjectClassFn(),
+                                         object,
+                                         object->getName() + ".Type");
+  metadata->setCallingConv(llvm::CallingConv::C);
+  metadata->setDoesNotThrow();
+  metadata->addAttribute(llvm::AttributeList::FunctionIndex,
+                         llvm::Attribute::ReadOnly);
+  return metadata;
+}
+
+/// Given an object of class type, produce the type metadata reference
+/// as a %type*.
+llvm::Value *irgen::emitDynamicTypeOfHeapObject(IRGenFunction &IGF,
+                                                llvm::Value *object,
+                                                MetatypeRepresentation repr,
+                                                SILType objectType,
+                                                bool allowArtificialSubclasses){
+  switch (auto isaEncoding =
+            getIsaEncodingForType(IGF.IGM, objectType.getASTType())) {
+  case IsaEncoding::Pointer:
+    // Directly load the isa pointer from a pure Swift class.
+    return emitLoadOfHeapMetadataRef(IGF, object, isaEncoding,
+                                     /*suppressCast*/ false);
+  case IsaEncoding::ObjC:
+    // A class defined in Swift that inherits from an Objective-C class may
+    // end up dynamically subclassed by ObjC runtime hackery. The artificial
+    // subclass isn't a formal Swift type, so isn't appropriate as the result
+    // of `type(of:)`, but is still a physical subtype of the real class object,
+    // so can be used for some purposes like satisfying type parameters in
+    // generic signatures.
+    if (allowArtificialSubclasses
+        && hasKnownSwiftMetadata(IGF.IGM, objectType.getASTType()))
+      return emitLoadOfHeapMetadataRef(IGF, object, isaEncoding,
+                                       /*suppressCast*/ false);
+   
+    // Ask the Swift runtime to find the dynamic type. This will look through
+    // dynamic subclasses of Swift classes, and use the -class message for
+    // ObjC classes.
+    return emitDynamicTypeOfOpaqueHeapObject(IGF, object, repr);
+  }
+}
+
+static ClassDecl *getRootClass(ClassDecl *theClass) {
+  while (theClass->hasSuperclass()) {
+    theClass = theClass->getSuperclass()->getClassOrBoundGenericClass();
+    assert(theClass && "base type of class not a class?");
+  }
+  return theClass;
+}
+
+/// What isa encoding mechanism does a type have?
+IsaEncoding irgen::getIsaEncodingForType(IRGenModule &IGM,
+                                         CanType type) {
+  if (!IGM.ObjCInterop) return IsaEncoding::Pointer;
+
+  // This needs to be kept up-to-date with hasKnownSwiftMetadata.
+
+  if (auto theClass = type->getClassOrBoundGenericClass()) {
+    // We can access the isas of pure Swift classes directly.
+    if (getRootClass(theClass)->hasKnownSwiftImplementation())
+      return IsaEncoding::Pointer;
+    // For ObjC or mixed classes, we need to use object_getClass.
+    return IsaEncoding::ObjC;
+  }
+  
+  // Existentials use the encoding of the enclosed dynamic type.
+  if (type->isAnyExistentialType()) {
+    return getIsaEncodingForType(IGM, ArchetypeType::getOpened(type));
+  }
+
+  if (auto archetype = dyn_cast<ArchetypeType>(type)) {
+    // If we have a concrete superclass constraint, just recurse.
+    if (auto superclass = archetype->getSuperclass()) {
+      return getIsaEncodingForType(IGM, superclass->getCanonicalType());
+    }
+
+    // Otherwise, we must just have a class constraint.  Use the
+    // conservative answer.
+    return IsaEncoding::ObjC;
+  }
+
+  // Non-class heap objects should be pure Swift, so we can access their isas
+  // directly.
+  return IsaEncoding::Pointer;
+}

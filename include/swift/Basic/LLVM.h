@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -15,8 +15,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SWIFT_AST_LLVM_H
-#define SWIFT_AST_LLVM_H
+#ifndef SWIFT_BASIC_LLVM_H
+#define SWIFT_BASIC_LLVM_H
 
 // Do not proliferate #includes here, require clients to #include their
 // dependencies.
@@ -28,8 +28,9 @@
 
 // Forward declarations.
 namespace llvm {
-  // Containers
+  // Containers.
   class StringRef;
+  class StringLiteral;
   class Twine;
   template <typename T> class SmallPtrSetImpl;
   template <typename T, unsigned N> class SmallPtrSet;
@@ -46,7 +47,7 @@ namespace llvm {
   class raw_ostream;
   class APInt;
   class APFloat;
-} // end namespace llvm;
+} // end namespace llvm
 
 
 namespace swift {
@@ -57,13 +58,14 @@ namespace swift {
   using llvm::dyn_cast_or_null;
   using llvm::cast_or_null;
 
-  // Containers
+  // Containers.
   using llvm::None;
   using llvm::Optional;
   using llvm::SmallPtrSetImpl;
   using llvm::SmallPtrSet;
   using llvm::SmallString;
   using llvm::StringRef;
+  using llvm::StringLiteral;
   using llvm::Twine;
   using llvm::SmallVectorImpl;
   using llvm::SmallVector;
@@ -79,4 +81,4 @@ namespace swift {
   using llvm::NoneType;
 } // end namespace swift
 
-#endif
+#endif // SWIFT_BASIC_LLVM_H

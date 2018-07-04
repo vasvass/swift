@@ -2,184 +2,119 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 //
-// This file implements helpers for constructing non-cryptographic hash
-// functions.
-//
-// This code was ported from LLVM's ADT/Hashing.h.
-//
-// Currently the algorithm is based on CityHash, but this is an implementation
-// detail.  Even more, there are facilities to mix in a per-execution seed to
-// ensure that hash values differ between executions.
+// This file implements helpers for hashing collections.
 //
 
-import SwiftShims
+/// This protocol is only used for compile-time checks that
+/// every buffer type implements all required operations.
+internal protocol _HashBuffer {
+  associatedtype Key
+  associatedtype Value
+  associatedtype Index
+  associatedtype SequenceElement
+  associatedtype SequenceElementWithoutLabels
+  var startIndex: Index { get }
+  var endIndex: Index { get }
 
-public // @testable
-struct _HashingDetail {
+  func index(after i: Index) -> Index
 
-  public // @testable
-  static var fixedSeedOverride: UInt64 {
+  func formIndex(after i: inout Index)
+
+  func index(forKey key: Key) -> Index?
+
+  func assertingGet(_ i: Index) -> SequenceElement
+
+  func assertingGet(_ key: Key) -> Value
+
+  func maybeGet(_ key: Key) -> Value?
+
+  @discardableResult
+  mutating func updateValue(_ value: Value, forKey key: Key) -> Value?
+
+  @discardableResult
+  mutating func insert(
+    _ value: Value, forKey key: Key
+  ) -> (inserted: Bool, memberAfterInsert: Value)
+
+  @discardableResult
+  mutating func remove(at index: Index) -> SequenceElement
+
+  @discardableResult
+  mutating func removeValue(forKey key: Key) -> Value?
+
+  mutating func removeAll(keepingCapacity keepCapacity: Bool)
+
+  var count: Int { get }
+
+  static func fromArray(_ elements: [SequenceElementWithoutLabels]) -> Self
+}
+
+/// The inverse of the default hash table load factor.  Factored out so that it
+/// can be used in multiple places in the implementation and stay consistent.
+/// Should not be used outside `Dictionary` implementation.
+@inlinable // FIXME(sil-serialize-all)
+@_transparent
+internal var _hashContainerDefaultMaxLoadFactorInverse: Double {
+  return 1.0 / 0.75
+}
+
+#if _runtime(_ObjC)
+/// Call `[lhs isEqual: rhs]`.
+///
+/// This function is part of the runtime because `Bool` type is bridged to
+/// `ObjCBool`, which is in Foundation overlay.
+/// FIXME(sil-serialize-all): this should be internal
+@usableFromInline // FIXME(sil-serialize-all)
+@_silgen_name("swift_stdlib_NSObject_isEqual")
+internal func _stdlib_NSObject_isEqual(_ lhs: AnyObject, _ rhs: AnyObject) -> Bool
+#endif
+
+
+/// A temporary view of an array of AnyObject as an array of Unmanaged<AnyObject>
+/// for fast iteration and transformation of the elements.
+///
+/// Accesses the underlying raw memory as Unmanaged<AnyObject> using untyped
+/// memory accesses. The memory remains bound to managed AnyObjects.
+@_fixed_layout // FIXME(sil-serialize-all)
+@usableFromInline // FIXME(sil-serialize-all)
+internal struct _UnmanagedAnyObjectArray {
+  /// Underlying pointer.
+  @usableFromInline // FIXME(sil-serialize-all)
+  internal var value: UnsafeMutableRawPointer
+
+  @inlinable // FIXME(sil-serialize-all)
+  internal init(_ up: UnsafeMutablePointer<AnyObject>) {
+    self.value = UnsafeMutableRawPointer(up)
+  }
+
+  @inlinable // FIXME(sil-serialize-all)
+  internal init?(_ up: UnsafeMutablePointer<AnyObject>?) {
+    guard let unwrapped = up else { return nil }
+    self.init(unwrapped)
+  }
+
+  @inlinable // FIXME(sil-serialize-all)
+  internal subscript(i: Int) -> AnyObject {
     get {
-      // HACK: the variable itself is defined in C++ code so that it is
-      // guaranteed to be statically initialized.  This is a temporary
-      // workaround until the compiler can do the same for Swift.
-      return _swift_stdlib_HashingDetail_fixedSeedOverride
+      let unmanaged = value.load(
+        fromByteOffset: i * MemoryLayout<AnyObject>.stride,
+        as: Unmanaged<AnyObject>.self)
+      return unmanaged.takeUnretainedValue()
     }
-    set {
-      _swift_stdlib_HashingDetail_fixedSeedOverride = newValue
+    nonmutating set(newValue) {
+      let unmanaged = Unmanaged.passUnretained(newValue)
+      value.storeBytes(of: unmanaged,
+        toByteOffset: i * MemoryLayout<AnyObject>.stride,
+        as: Unmanaged<AnyObject>.self)
     }
   }
-
-  @_transparent
-  @warn_unused_result
-  static func getExecutionSeed() -> UInt64 {
-    // FIXME: This needs to be a per-execution seed. This is just a placeholder
-    // implementation.
-    let seed: UInt64 = 0xff51afd7ed558ccd
-    return _HashingDetail.fixedSeedOverride == 0 ? seed : fixedSeedOverride
-  }
-
-  @_transparent
-  @warn_unused_result
-  static func hash16Bytes(low: UInt64, _ high: UInt64) -> UInt64 {
-    // Murmur-inspired hashing.
-    let mul: UInt64 = 0x9ddfea08eb382d69
-    var a: UInt64 = (low ^ high) &* mul
-    a ^= (a >> 47)
-    var b: UInt64 = (high ^ a) &* mul
-    b ^= (b >> 47)
-    b = b &* mul
-    return b
-  }
 }
-
-//
-// API functions.
-//
-
-//
-// _mix*() functions all have type (T) -> T.  These functions don't compress
-// their inputs and just exhibit avalance effect.
-//
-
-@_transparent
-@warn_unused_result
-public // @testable
-func _mixUInt32(value: UInt32) -> UInt32 {
-  // Zero-extend to 64 bits, hash, select 32 bits from the hash.
-  //
-  // NOTE: this differs from LLVM's implementation, which selects the lower
-  // 32 bits.  According to the statistical tests, the 3 lowest bits have
-  // weaker avalanche properties.
-  let extendedValue = UInt64(value)
-  let extendedResult = _mixUInt64(extendedValue)
-  return UInt32((extendedResult >> 3) & 0xffff_ffff)
-}
-
-@_transparent
-@warn_unused_result
-public // @testable
-func _mixInt32(value: Int32) -> Int32 {
-  return Int32(bitPattern: _mixUInt32(UInt32(bitPattern: value)))
-}
-
-@_transparent
-@warn_unused_result
-public // @testable
-func _mixUInt64(value: UInt64) -> UInt64 {
-  // Similar to hash_4to8_bytes but using a seed instead of length.
-  let seed: UInt64 = _HashingDetail.getExecutionSeed()
-  let low: UInt64 = value & 0xffff_ffff
-  let high: UInt64 = value >> 32
-  return _HashingDetail.hash16Bytes(seed &+ (low << 3), high)
-}
-
-@_transparent
-@warn_unused_result
-public // @testable
-func _mixInt64(value: Int64) -> Int64 {
-  return Int64(bitPattern: _mixUInt64(UInt64(bitPattern: value)))
-}
-
-@_transparent
-@warn_unused_result
-public // @testable
-func _mixUInt(value: UInt) -> UInt {
-#if arch(i386) || arch(arm)
-  return UInt(_mixUInt32(UInt32(value)))
-#elseif arch(x86_64) || arch(arm64)
-  return UInt(_mixUInt64(UInt64(value)))
-#endif
-}
-
-@_transparent
-@warn_unused_result
-public // @testable
-func _mixInt(value: Int) -> Int {
-#if arch(i386) || arch(arm)
-  return Int(_mixInt32(Int32(value)))
-#elseif arch(x86_64) || arch(arm64)
-  return Int(_mixInt64(Int64(value)))
-#endif
-}
-
-/// Given a hash value, returns an integer value within the given range that
-/// corresponds to a hash value.
-///
-/// This function is superior to computing the remainder of `hashValue` by
-/// the range length.  Some types have bad hash functions; sometimes simple
-/// patterns in data sets create patterns in hash values and applying the
-/// remainder operation just throws away even more information and invites
-/// even more hash collisions.  This effect is especially bad if the length
-/// of the required range is a power of two -- applying the remainder
-/// operation just throws away high bits of the hash (which would not be
-/// a problem if the hash was known to be good).  This function mixes the
-/// bits in the hash value to compensate for such cases.
-///
-/// Of course, this function is a compressing function, and applying it to a
-/// hash value does not change anything fundamentally: collisions are still
-/// possible, and it does not prevent malicious users from constructing data
-/// sets that will exhibit pathological collisions.
-@warn_unused_result
-public // @testable
-func _squeezeHashValue(hashValue: Int, _ resultRange: Range<Int>) -> Int {
-  // Length of a Range<Int> does not fit into an Int, but fits into an UInt.
-  // An efficient way to compute the length is to rely on two's complement
-  // arithmetic.
-  let resultCardinality =
-    UInt(bitPattern: resultRange.endIndex &- resultRange.startIndex)
-
-  // Calculate the result as `UInt` to handle the case when
-  // `resultCardinality >= Int.max`.
-  let unsignedResult =
-    _squeezeHashValue(hashValue, UInt(0)..<resultCardinality)
-
-  // We perform the unchecked arithmetic on `UInt` (instead of doing
-  // straightforward computations on `Int`) in order to handle the following
-  // tricky case: `startIndex` is negative, and `resultCardinality >= Int.max`.
-  // We can not convert the latter to `Int`.
-  return
-    Int(bitPattern:
-      UInt(bitPattern: resultRange.startIndex) &+ unsignedResult)
-}
-
-@warn_unused_result
-public // @testable
-func _squeezeHashValue(hashValue: Int, _ resultRange: Range<UInt>) -> UInt {
-  let mixedHashValue = UInt(bitPattern: _mixInt(hashValue))
-  let resultCardinality: UInt = resultRange.endIndex - resultRange.startIndex
-  if _isPowerOf2(resultCardinality) {
-    return mixedHashValue & (resultCardinality - 1)
-  }
-  return resultRange.startIndex + (mixedHashValue % resultCardinality)
-}
-

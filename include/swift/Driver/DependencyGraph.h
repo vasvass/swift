@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -32,6 +32,8 @@ namespace llvm {
 }
 
 namespace swift {
+
+class UnifiedStatsReporter;
 
 /// The non-templated implementation of DependencyGraph.
 ///
@@ -65,12 +67,14 @@ public:
   class MarkTracerImpl {
     class Entry;
     llvm::DenseMap<const void *, SmallVector<Entry, 4>> Table;
+    UnifiedStatsReporter *Stats;
 
     friend class DependencyGraphImpl;
   protected:
-    MarkTracerImpl();
+    explicit MarkTracerImpl(UnifiedStatsReporter *Stats);
     ~MarkTracerImpl();
-
+    void countStatsForNodeMarking(const OptionSet<DependencyKind> &Kind,
+                                  bool Cascading) const;
     void printPath(raw_ostream &out, const void *item,
                    llvm::function_ref<void(const void *)> printItem) const;
   };
@@ -94,7 +98,7 @@ private:
   static_assert(std::is_move_constructible<ProvidesEntryTy>::value, "");
 
   /// The "outgoing" edge map. This lists all outgoing (kind, string) edges
-  /// representing satisified dependencies from a particular node.
+  /// representing satisfied dependencies from a particular node.
   ///
   /// For multiple outgoing edges with the same string, the kinds are combined
   /// into one field.
@@ -119,8 +123,16 @@ private:
   /// The set of marked nodes.
   llvm::SmallPtrSet<const void *, 16> Marked;
 
-  /// A list of all "external" dependencies that cannot be resolved just from
-  /// this dependency graph.
+  /// A list of all external dependencies that cannot be resolved from just this
+  /// dependency graph. Each member of the set is the name of a file which is
+  /// not in the module. These files' contents may (or may not) have affected
+  /// the module's compilation. This list may even include the paths of
+  /// non-existent files whose absence is significant.
+  ///
+  /// Furthermore, this set might not exhaustive. It only includes dependencies
+  /// that will be checked by the driver's incremental mode.
+  /// For example, it might excludes headers in the SDK if the cost
+  /// of `stat`ing them were to outweigh the likelihood that they would change.
   llvm::StringSet<> ExternalDependencies;
 
   /// The interface hash for each node. This determines if the interface of
@@ -136,11 +148,11 @@ private:
   class StringSetIterator {
     llvm::StringSet<>::const_iterator I;
   public:
-    typedef llvm::StringSet<>::const_iterator::value_type value_type;
-    typedef std::input_iterator_tag iterator_category;
-    typedef ptrdiff_t difference_type;
-    typedef value_type &reference;
-    typedef value_type *pointer;
+    using value_type = llvm::StringSet<>::const_iterator::value_type;
+    using iterator_category = std::input_iterator_tag;
+    using difference_type = ptrdiff_t;
+    using reference = value_type &;
+    using pointer = value_type *;
 
     /*implicit*/ StringSetIterator(llvm::StringSet<>::const_iterator base)
        : I(base) {}
@@ -223,7 +235,8 @@ public:
   /// This is intended to be a debugging aid.
   class MarkTracer : public MarkTracerImpl {
   public:
-    MarkTracer() = default;
+    explicit MarkTracer(UnifiedStatsReporter *Stats)
+      : MarkTracerImpl(Stats) {}
 
     /// Dump the path that led to \p node.
     void printPath(raw_ostream &out, T node,

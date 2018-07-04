@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -60,7 +60,7 @@ enum class LayoutKind {
 class NonFixedOffsetsImpl;
 
 /// The type to pass around for non-fixed offsets.
-typedef Optional<NonFixedOffsetsImpl*> NonFixedOffsets;
+using NonFixedOffsets = Optional<NonFixedOffsetsImpl *>;
 
 /// An abstract class for determining non-fixed offsets.
 class NonFixedOffsetsImpl {
@@ -100,8 +100,16 @@ public:
 private:
   enum : unsigned { IncompleteKind  = 4 };
 
-  /// The swift type information for this element.
-  const TypeInfo *Type;
+  /// The swift type information for this element's layout.
+  const TypeInfo *TypeLayout;
+
+  /// The swift type information for this element's access.
+  ///
+  /// Almost always the same as the layout type info, except for classes
+  /// we have a workaround where we must perform layout as if the type
+  /// was completely fragile, since the Objective-C runtime does not
+  /// support classes with an unknown instance size.
+  const TypeInfo *TypeAccess;
 
   /// The offset in bytes from the start of the struct.
   unsigned ByteOffset;
@@ -117,16 +125,18 @@ private:
   /// The kind of layout performed for this element.
   unsigned TheKind : 3;
 
-  explicit ElementLayout(const TypeInfo &type)
-    : Type(&type), TheKind(IncompleteKind) {}
+  explicit ElementLayout(const TypeInfo &typeLayout,
+                         const TypeInfo &typeAccess)
+    : TypeLayout(&typeLayout), TypeAccess(&typeAccess), TheKind(IncompleteKind) {}
 
   bool isCompleted() const {
     return (TheKind != IncompleteKind);
   }
 
 public:
-  static ElementLayout getIncomplete(const TypeInfo &type) {
-    return ElementLayout(type);
+  static ElementLayout getIncomplete(const TypeInfo &typeLayout,
+                                     const TypeInfo &typeAccess) {
+    return ElementLayout(typeLayout, typeAccess);
   }
 
   void completeFrom(const ElementLayout &other) {
@@ -137,9 +147,13 @@ public:
     Index = other.Index;
   }
 
-  void completeEmpty(IsPOD_t isPOD) {
+  void completeEmpty(IsPOD_t isPOD, Size byteOffset) {
     TheKind = unsigned(Kind::Empty);
     IsPOD = unsigned(isPOD);
+    // We still want to give empty fields an offset for use by things like
+    // ObjC ivar emission. We use the first field in a class layout as the
+    // instanceStart.
+    ByteOffset = byteOffset.getValue();
     Index = 0; // make a complete write of the bitfield
   }
 
@@ -167,7 +181,9 @@ public:
     Index = nonFixedElementIndex;
   }
 
-  const TypeInfo &getType() const { return *Type; }
+  const TypeInfo &getTypeForLayout() const { return *TypeLayout; }
+
+  const TypeInfo &getTypeForAccess() const { return *TypeAccess; }
 
   Kind getKind() const {
     assert(isCompleted());
@@ -187,7 +203,8 @@ public:
 
   /// Given that this element has a fixed offset, return that offset in bytes.
   Size getByteOffset() const {
-    assert(isCompleted() && getKind() == Kind::Fixed);
+    assert(isCompleted() &&
+           (getKind() == Kind::Fixed || getKind() == Kind::Empty));
     return Size(ByteOffset);
   }
 
@@ -214,9 +231,9 @@ public:
 class StructLayoutBuilder {
 protected:
   IRGenModule &IGM;
-private:
   SmallVector<llvm::Type*, 8> StructFields;
   Size CurSize = Size(0);
+private:
   Alignment CurAlignment = Alignment(1);
   SpareBitVector CurSpareBits;
   unsigned NextNonFixedOffsetIndex = 0;
@@ -228,9 +245,12 @@ public:
   StructLayoutBuilder(IRGenModule &IGM) : IGM(IGM) {}
 
   /// Add a swift heap header to the layout.  This must be the first
-  /// call to the layout.
+  /// thing added to the layout.
   void addHeapHeader();
-
+  /// Add the NSObject object header to the layout. This must be the first
+  /// thing added to the layout.
+  void addNSObjectHeader();
+  
   /// Add a number of fields to the layout.  The field layouts need
   /// only have the TypeInfo set; the rest will be filled out.
   ///
@@ -238,6 +258,13 @@ public:
   /// requirements of the layout.
   bool addFields(llvm::MutableArrayRef<ElementLayout> fields,
                  LayoutStrategy strategy);
+
+  /// Add a field to the layout.  The field layout needs
+  /// only have the TypeInfo set; the rest will be filled out.
+  ///
+  /// Returns true if the field may have increased the storage
+  /// requirements of the layout.
+  bool addField(ElementLayout &elt, LayoutStrategy strategy);
 
   /// Return whether the layout is known to be empty.
   bool empty() const { return IsFixedLayout && CurSize == Size(0); }
@@ -380,10 +407,40 @@ public:
                      const llvm::Twine &name = "") const;
 };
 
-Size getHeapHeaderSize(IRGenModule &IGM);
+/// Different policies for accessing a physical field.
+enum class FieldAccess : uint8_t {
+  /// Instance variable offsets are constant.
+  ConstantDirect,
+  
+  /// Instance variable offsets must be loaded from "direct offset"
+  /// global variables.
+  NonConstantDirect,
+  
+  /// Instance variable offsets are kept in fields in metadata, but
+  /// the offsets of those fields within the metadata are constant.
+  ConstantIndirect
+};
 
-void addHeapHeaderToLayout(IRGenModule &IGM, Size &size, Alignment &align,
-                           SmallVectorImpl<llvm::Type*> &fieldTypes);
+struct ClassLayout {
+  /// Lazily-initialized array of all fragile stored properties in the class
+  /// (including superclass stored properties).
+  ArrayRef<VarDecl*> AllStoredProperties;
+  /// Lazily-initialized array of all fragile stored properties inherited from
+  /// superclasses.
+  ArrayRef<VarDecl*> InheritedStoredProperties;
+  /// Lazily-initialized array of all field access methods.
+  ArrayRef<FieldAccess> AllFieldAccesses;
+  /// Does the class metadata require dynamic initialization.
+  bool MetadataRequiresDynamicInitialization;
+
+  unsigned getFieldIndex(VarDecl *field) const {
+    // FIXME: This is algorithmically terrible.
+    auto found = std::find(AllStoredProperties.begin(),
+                           AllStoredProperties.end(), field);
+    assert(found != AllStoredProperties.end() && "didn't find field in type?!");
+    return found - AllStoredProperties.begin();
+  }
+};
 
 } // end namespace irgen
 } // end namespace swift

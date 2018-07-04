@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -30,12 +30,14 @@ protected:
   WeakTypeInfo(llvm::Type *type, Size size, Alignment align,
                const SpareBitVector &spareBits)
     : FixedTypeInfo(type, size, spareBits, align, IsNotPOD,
-                    IsNotBitwiseTakable, IsFixedSize, STIK_Weak) {}
+                    IsNotBitwiseTakable, IsFixedSize,
+                    SpecialTypeInfoKind::Weak) {}
 
   WeakTypeInfo(llvm::Type *type, Size size, Alignment align,
                SpareBitVector &&spareBits)
     : FixedTypeInfo(type, size, std::move(spareBits), align, IsNotPOD,
-                    IsNotBitwiseTakable, IsFixedSize, STIK_Weak) {}
+                    IsNotBitwiseTakable, IsFixedSize,
+                    SpecialTypeInfoKind::Weak) {}
 
 public:
   virtual void weakLoadStrong(IRGenFunction &IGF, Address addr,
@@ -49,7 +51,7 @@ public:
 
   static bool classof(const WeakTypeInfo *type) { return true; }
   static bool classof(const TypeInfo *type) {
-    return type->getSpecialTypeInfoKind() == STIK_Weak;
+    return type->getSpecialTypeInfoKind() == SpecialTypeInfoKind::Weak;
   }
 };
 
